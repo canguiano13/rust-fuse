@@ -3,7 +3,7 @@
 //4kb blocks
 const BLOCK_SIZE: u32 = 4096;
 //4mb total filesystem size
-const NUM_BLOCKS: u32 = 1024; 
+const NUM_BLOCKS: u32 = 1024;
 //total number of possible files
 const NUM_INODES: u32 = 256;
 
@@ -25,7 +25,7 @@ impl Superblock{
             num_blocks: NUM_BLOCKS,
             num_inodes: NUM_INODES,
             num_free_inodes: NUM_INODES,
-            num_free_blocks: NUM_BLOCKS 
+            num_free_blocks: NUM_BLOCKS
         }
     }
     //some other functions for this impl
@@ -37,19 +37,19 @@ impl Superblock{
     //create_link()?
     //
 }
-    
+
 
 ////inode bitmap
 //information about which spaces in the inode table are currently free
 struct InodeBitmap{
-    //array of bits 
+    //array of bits
     bits: [bool; NUM_INODES as usize]
 }
 impl InodeBitmap{
     //return a new bitmap
 
     fn new() -> InodeBitmap{
-        println!("Created an inode bitmap.."); 
+        println!("Created an inode bitmap..");
 
         //initially all spaces are free
         let bits = [false; NUM_INODES as usize];
@@ -77,10 +77,10 @@ impl DataBitmap{
         println!("Created a new data bitmap..");
         let bits = [false; NUM_BLOCKS as usize];
         DataBitmap{
-            bits 
+            bits
         }
     }
-    
+
     //some other functions for this impl
     //markFree() -> set a location in the data bitmap as free
     //markUsed() -> set a location in the data bitmap as not free
@@ -125,7 +125,7 @@ impl InodeTable{
         let mut inodes = Vec::new();
         for i in 0..NUM_INODES{
             inodes.push(None);
-        }   
+        }
 
         InodeTable{
             inodes
