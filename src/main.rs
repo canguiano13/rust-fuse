@@ -1,21 +1,26 @@
 use std::fs::File;
+use bitmaps::Bitmap;
 
 // superblock
 struct Superblock {
+    fsid: u32, // magic number identifying the file system
     block_size: u32,
-    num_inodes: u32,
-    num_free_inodes: u32,
-    num_blocks: u32,
-    num_free_blocks: u32
+    bitmap_size: u64,
+    num_inodes: u64,
+    num_free_inodes: u64,
+    num_blocks: u64,
+    num_free_blocks: u64,
 }
 
-// TODO: Think more about how to represent bitmaps in memory. Maybe use bitmap crate?
-type InodeBitmap = [bool];
-type DataBitmap = [bool];
-
+// The first value is the start location; the second value is the extent length.
+type Extent = (u64, u64);
 // table/map with inodes (inode number -> inode structure)
 // inode structure
 // -- pointers to data blocks
+// TODO: Figure out what's happening here with the derive thing --- was it assuming
+// use of the serde crate? Also, we need to figure out how to get the exact size
+// after serialization for these inode structures so we can properly compute
+// offset values for data blocks.
 #[derive(Serialize, Deserialize)]
 struct InodeAttributes {
     pub inode: u64,
@@ -30,27 +35,36 @@ struct InodeAttributes {
     pub hardlinks: u32,
     pub uid: u32,
     pub gid: u32,
-    pub xattrs: BTreeMap<Vec<u8>, Vec<u8>>, // TODO: Figure out if we need this.
+    // A fixed array for extents.
+    pub extent_index: [Extent; 8],
+    // A pointer to the location of an indirect block of extents (if needed).
+    pub extent_indirect: u64,
+    // pub xattrs: BTreeMap<Vec<u8>, Vec<u8>>, // TODO: Figure out if we need this.
 }
 
 // Options for inode table data structure:
 // - hashmap
 // - b-tree
-// - straight line data structure: vector or array
+// - flat data structure: vector or array
+// NOTE: Let's start with a flat data structure. This should be sized
+// according to the max # of inodes allowed in the inode bitmap, i.e 32K.
 type InodeTable = [Option<InodeAttributes>];
 
 // actual data region
 type DataRegion = File;
 
+// TODO: basically just read sections from/write sections to the file when needed.
+
 struct FuseFS {
     superblock: Superblock,
-    inode_bitmap: InodeBitmap,
-    data_bitmap: DataBitmap,
+    inode_bitmap: Bitmap,
+    data_bitmap: Bitmap,
     inode_table: InodeTable,
     data_region: DataRegion,
 }
 
 impl FuseFS {
+    // TODO: new() needs to take some configuration arguments.
     fn new() -> FuseFS {
         debug!("Creating filesystem..");
         let superblock = Superblock::new();
@@ -114,6 +128,9 @@ fn main() {
     // }
 
     cfg.n_threads = Some(args.n_threads);
+    // TODO: Allow various additional configuration options for superblock
+    // metadata, but give defaults.
+    // TODO: Maybe allow groups, i.e. separate blocks
     let result = fuser::mount(
         SimpleFS::new(args.data_dir, args.direct_io, args.suid),
         &args.mount_point,
