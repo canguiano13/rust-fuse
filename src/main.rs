@@ -1,20 +1,44 @@
 use std::fs::File;
+use std::mem;
 use bitmaps::Bitmap;
 
-// superblock
+
+const FSID: u32 = 0x55555;
+
 struct Superblock {
-    fsid: u32, // magic number identifying the file system
+    // Magic number identifying the file system.
+    fsid: u32,
+    // Block size in bytes.
     block_size: u32,
-    bitmap_size: u64,
-    num_inodes: u64,
-    num_free_inodes: u64,
     num_blocks: u64,
-    num_free_blocks: u64,
+    num_inodes: u64,
+    // Start location of the first bitmap.
+    bitmap_start: u64,
+    // Start location of the inode table.
+    itable_start: u64,
+    // Start location of the data blocks.
+    data_start: u64,
+}
+
+impl Superblock {
+    fn new(bsize_bytes: u32, bmapsize_bytes: u64) {
+        // Use std::mem.size_of to get an aligned size calculation.
+        let sb_size = size_of<Superblock>();
+        Superblock {
+            fsid: FSID,
+            block_size: bsize_bytes,
+            num_blocks: bmapsize_bytes * 8,
+            num_inodes: bmapsize_bytes * 8,
+            bitmap_start: sb_size,
+            itable_start: bitmap_start + 2 * bmapsize,
+            data_start: itable_start + size_of<InodeAttributes>() * num_inodes,
+        };
+    }
 }
 
 // The first value is the start location; the second value is the extent length.
 type Extent = (u64, u64);
-// table/map with inodes (inode number -> inode structure)
+
 // inode structure
 // -- pointers to data blocks
 // TODO: Figure out what's happening here with the derive thing --- was it assuming
@@ -39,9 +63,9 @@ struct InodeAttributes {
     pub extent_index: [Extent; 8],
     // A pointer to the location of an indirect block of extents (if needed).
     pub extent_indirect: u64,
-    // pub xattrs: BTreeMap<Vec<u8>, Vec<u8>>, // TODO: Figure out if we need this.
 }
 
+// table/map with inodes (inode number -> inode structure)
 // Options for inode table data structure:
 // - hashmap
 // - b-tree
@@ -51,16 +75,19 @@ struct InodeAttributes {
 type InodeTable = [Option<InodeAttributes>];
 
 // actual data region
-type DataRegion = File;
-
 // TODO: basically just read sections from/write sections to the file when needed.
+// TODO: we might not need a specific type for this if we just represent the
+// entire block store as a file. Alternatively, it would be interesting if we
+// wanted to keep pieces of these files in memory, in which case perhaps it would
+// be useful to have a separate data structure to store the data region.
+// type DataRegion = File;
 
 struct FuseFS {
     superblock: Superblock,
     inode_bitmap: Bitmap,
     data_bitmap: Bitmap,
     inode_table: InodeTable,
-    data_region: DataRegion,
+    block_store_fd: File,
 }
 
 impl FuseFS {
@@ -71,7 +98,11 @@ impl FuseFS {
         let inode_bitmap = InodeBitmap::new();
         let data_bitmap = DataBitmap::new();
         let inode_table = InodeTable::new();
-        let data_region = DataRegion::new();
+        // TODO: Figure out how you want to manage the data region. I think it
+        // makes sense to just have an open File object representing the entire
+        // block, and then just use the offsets to write to the proper places
+        // in the data region.
+        let block_store_fd = File;
         FuseFS {
             superblock,
             inode_bitmap,
@@ -92,6 +123,9 @@ impl Filesystem for FuseFS {
 
 fn main() {
     let args = Args::parse();
+    // TODO: One of the arguments here should be the name of the file to allocate
+    // as the backing "block store" for our filesystem. I guess this file could
+    // have any suffix, although it would be nice to enforce a .fs format name.
 
     // let log_level = match args.v {
     //     0 => LevelFilter::Error,
