@@ -120,7 +120,7 @@ impl FuseFS {
 impl Filesystem for FuseFS {
     // TODO: Fill out this stuff.
     // Adding read and write
-    fn read(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64, _size: u32, _flags: OpenFlags, _lock: Option<LockOwner>, reply: ReplyData) {
+    fn read(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64, size: u32, _flags: OpenFlags, _lock: Option<LockOwner>, reply: ReplyData) {
         // check if inode really exist
         if !self.inode_bitmap.get(ino.0 as usize) {
             // If the bit is 0, file doesn't exist
@@ -134,8 +134,8 @@ impl Filesystem for FuseFS {
         // create buffer, value starts at 0, type is u8
         let mut buffer = vec![0u8; size as usize];
 
-        // Adding file to buffer at exact offset address, check if read is successful and return data, otherwise return error
-        match self.block_store_fd.read_at(&mut buffer, physical_offset + offset as u64) {
+        // Adding file to buffer at exact offset address, check if read is successful and return data, otherwise just return error
+        match self.block_store_fd.read_at(&mut buffer, file_base_address + offset as u64) {
             Ok(bytes_read) => reply.data(&buffer[..bytes_read]),
             Err(_) => reply.error(libc::EIO),
         }
