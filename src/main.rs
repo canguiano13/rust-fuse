@@ -2,7 +2,13 @@ use std::fs::File;
 use std::mem;
 use bitmaps::Bitmap;
 use std::os::unix::fs::FileExt; //for read write
+use clap::Parser;
 
+use log::LevelFilter;
+use log::debug;
+use log::error;
+use log::info;
+use log::warn;
 
 const FSID: u32 = 0x55555;
 
@@ -22,16 +28,18 @@ struct Superblock {
 }
 
 impl Superblock {
-    fn new(bsize_bytes: u32, bmapsize_bytes: u64) {
+    fn new(block_size: u32, num_inodes: u64, num_blocks: u64) {
         // Use std::mem.size_of to get an aligned size calculation.
         let sb_size = size_of<Superblock>();
         Superblock {
             fsid: FSID,
-            block_size: bsize_bytes,
-            num_blocks: bmapsize_bytes * 8,
-            num_inodes: bmapsize_bytes * 8,
+            block_size,
+            num_inodes,
+            num_blocks,
             bitmap_start: sb_size,
-            itable_start: bitmap_start + 2 * bmapsize,
+            // We divide by 8 since addresses (basically pointers to locations
+            // in a file) are in terms of bytes (not bits).
+            itable_start: bitmap_start + (num_inodes / 8) + (num_blocks / 8),
             data_start: itable_start + size_of<InodeAttributes>() * num_inodes,
         };
     }
@@ -73,44 +81,38 @@ struct InodeAttributes {
 // - flat data structure: vector or array
 // NOTE: Let's start with a flat data structure. This should be sized
 // according to the max # of inodes allowed in the inode bitmap, i.e 32K.
-type InodeTable = [Option<InodeAttributes>];
-
-// actual data region
-// TODO: basically just read sections from/write sections to the file when needed.
-// TODO: we might not need a specific type for this if we just represent the
-// entire block store as a file. Alternatively, it would be interesting if we
-// wanted to keep pieces of these files in memory, in which case perhaps it would
-// be useful to have a separate data structure to store the data region.
-// type DataRegion = File;
+type InodeTable = [InodeAttributes];
 
 struct FuseFS {
     superblock: Superblock,
-    inode_bitmap: Bitmap,
-    data_bitmap: Bitmap,
+    inode_bitmap: [Bitmap],
+    data_bitmap: [Bitmap],
     inode_table: InodeTable,
     block_store_fd: File,
 }
 
 impl FuseFS {
-    // TODO: new() needs to take some configuration arguments.
-    fn new() -> FuseFS {
+    fn new(block_size: u32, num_inodes: u64, num_blocks: u64, store_fp: str) -> Result<FuseFS> {
         debug!("Creating filesystem..");
-        let superblock = Superblock::new();
-        let inode_bitmap = InodeBitmap::new();
-        let data_bitmap = DataBitmap::new();
-        let inode_table = InodeTable::new();
-        // TODO: Figure out how you want to manage the data region. I think it
-        // makes sense to just have an open File object representing the entire
-        // block, and then just use the offsets to write to the proper places
-        // in the data region.
-        let block_store_fd = File;
+        let superblock = Superblock::new(block_size, num_inodes, num_blocks);
+        // TODO: Check if this syntax actually does what you want it to do.
+        let inode_bitmap = [Bitmap<1024>(); (num_inodes / 1024)];
+        let data_bitmap = [Bitmap<1024>(); (num_blocks / 1024)];
+        let inode_table = [InodeAttributes; num_inodes];
+        let block_store_fd = File::create(store_fp)?;
         FuseFS {
             superblock,
             inode_bitmap,
             data_bitmap,
             inode_table,
-            data_region
+            block_store_fd,
         }
+    }
+
+    fn load(store_fp: str) -> Result<FuseFS> {
+        // Read file superblock
+        // Read in all data needed to re-create the filesystem
+        // Return the loaded filesystem
     }
 }
 
@@ -127,7 +129,7 @@ impl Filesystem for FuseFS {
             reply.error(libc::ENOENT);
             return;
         }
-        
+
         // calculate start location, start from superblock and jump slots
         let file_base_address = self.superblock.data_start + (ino.0 * self.superblock.block_size as u64);
 
@@ -142,6 +144,48 @@ impl Filesystem for FuseFS {
     }
 }
 
+#[derive(Parser)]
+#[command(version, author = "Lucas Du, Carlos Anguiano, Simon Zheng")]
+// TODO: Need to add to this.
+struct Args {
+    /// Set local directory used to store data
+    #[clap(long, default_value = "/tmp/fuser")]
+    data_dir: String,
+
+    // TODO: make positional like other examples.
+    /// Act as a client, and mount FUSE at given path
+    #[clap(long, default_value = "")]
+    mount_point: String,
+
+    /// Mount FUSE with direct IO
+    #[clap(long, requires = "mount_point")]
+    direct_io: bool,
+
+    /// Automatically unmount FUSE when process exits
+    #[clap(long)]
+    auto_unmount: bool,
+
+    /// Run a filesystem check
+    #[clap(long)]
+    fsck: bool,
+
+    /// Enable setuid support when run as root
+    #[clap(long)]
+    suid: bool,
+
+    #[clap(long, default_value_t = 1)]
+    n_threads: usize,
+
+    /// Sets the level of verbosity
+    #[clap(short, action = clap::ArgAction::Count)]
+    v: u8,
+
+    #[clap(long, default_value_t = 4096)]
+    block_size: u32,
+
+    // TODO: Add in num inodes and blocks bitmaps.
+}
+
 
 fn main() {
     let args = Args::parse();
@@ -149,44 +193,43 @@ fn main() {
     // as the backing "block store" for our filesystem. I guess this file could
     // have any suffix, although it would be nice to enforce a .fs format name.
 
-    // let log_level = match args.v {
-    //     0 => LevelFilter::Error,
-    //     1 => LevelFilter::Warn,
-    //     2 => LevelFilter::Info,
-    //     3 => LevelFilter::Debug,
-    //     _ => LevelFilter::Trace,
-    // };
-    // env_logger::builder()
-    //     .format_timestamp_nanos()
-    //     .filter_level(log_level)
-    //     .init();
+    let log_level = match args.v {
+        0 => LevelFilter::Error,
+        1 => LevelFilter::Warn,
+        2 => LevelFilter::Info,
+        3 => LevelFilter::Debug,
+        _ => LevelFilter::Trace,
+    };
+    env_logger::builder()
+        .format_timestamp_nanos()
+        .filter_level(log_level)
+        .init();
 
-    // let mut cfg = Config::default();
-    // cfg.mount_options = vec![MountOption::FSName("fuser".to_string())];
 
-    // if args.suid {
-    //     info!("setuid bit support enabled");
-    //     cfg.mount_options.push(MountOption::Suid);
-    // }
-    // if args.auto_unmount {
-    //     cfg.mount_options.push(MountOption::AutoUnmount);
-    // }
-    // if let Ok(enabled) = fuse_allow_other_enabled() {
-    //     if enabled {
-    //         cfg.acl = SessionACL::All;
-    //     }
-    // } else {
-    //     eprintln!("Unable to read /etc/fuse.conf");
-    // }
-    // if cfg.mount_options.contains(&MountOption::AutoUnmount) && cfg.acl != SessionACL::RootAndOwner
-    // {
-    //     cfg.acl = SessionACL::All;
-    // }
+    let mut cfg = Config::default();
+    cfg.mount_options = vec![MountOption::FSName("fuser".to_string())];
+
+    if args.suid {
+        info!("setuid bit support enabled");
+        cfg.mount_options.push(MountOption::Suid);
+    }
+    if args.auto_unmount {
+        cfg.mount_options.push(MountOption::AutoUnmount);
+    }
+    if let Ok(enabled) = fuse_allow_other_enabled() {
+        if enabled {
+            cfg.acl = SessionACL::All;
+        }
+    } else {
+        eprintln!("Unable to read /etc/fuse.conf");
+    }
+    if cfg.mount_options.contains(&MountOption::AutoUnmount) && cfg.acl != SessionACL::RootAndOwner
+    {
+        cfg.acl = SessionACL::All;
+    }
 
     cfg.n_threads = Some(args.n_threads);
-    // TODO: Allow various additional configuration options for superblock
-    // metadata, but give defaults.
-    // TODO: Maybe allow groups, i.e. separate blocks
+
     let result = fuser::mount(
         SimpleFS::new(args.data_dir, args.direct_io, args.suid),
         &args.mount_point,

@@ -11,7 +11,7 @@ The first filesystem is an extremely minimal implementation in the style of vsfs
 - Extremely minimal access control: only mode bits and UID/GID.
 - No support for xattrs.
 
-### to-dos (by Friday 2/27/26!)
+### to-dos (by Sunday 3/1/26!)
 1. Get configuration set up for various filesystem knobs, implement filesystem initialization function.
 2. Write up helper functions for allocating space on the "block storage" file.
 3. Add in serialization and implement calculation for offset/"address" calculation.
