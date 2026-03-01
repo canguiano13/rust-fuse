@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::io;
+use std::io::prelude::*;
 use std::io::ErrorKind;
 use std::io::BufReader;
 use std::io::BufRead;
@@ -29,7 +30,6 @@ use fuser::LockOwner;
 use fuser::ReplyData;
 use fuser::Config;
 
-
 const FSID: u32 = 0x55555;
 
 struct Superblock {
@@ -48,7 +48,7 @@ struct Superblock {
 }
 
 impl Superblock {
-    fn new(block_size: u32, num_inodes: u64, num_blocks: u64) {
+    fn new(block_size: u32, num_inodes: u64, num_blocks: u64) -> Superblock {
         // Use std::mem.size_of to get an aligned size calculation.
         let sb_size = size_of::<Superblock>() as u64;
         let it_start = sb_size + (num_inodes / 8) + (num_blocks / 8);
@@ -63,23 +63,24 @@ impl Superblock {
             // in a file) are in terms of bytes (not bits).
             itable_start: it_start,
             data_start: da_start,
-        };
+        }
     }
 }
 
 // The first value is the start location; the second value is the extent length.
 type Extent = (u64, u64);
 
-#[derive(Serialize, Deserialize, Copy, Clone, PartialEq)]
+// TODO: Why does simple.rs use FileKind and not just fuser::FileType? Should
+// we continue to do this?
+#[derive(Serialize, Deserialize, Copy, Clone, PartialEq, Default)]
 enum FileKind {
+    #[default]
     File,
     Directory,
     Symlink,
 }
 
-// inode structure
-// -- pointers to data blocks
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Default, Clone)]
 struct InodeAttributes {
     pub inode: u64,
     // Ref count of open file handles to this inode
@@ -88,7 +89,6 @@ struct InodeAttributes {
     pub last_accessed: (i64, u32),
     pub last_modified: (i64, u32),
     pub last_metadata_changed: (i64, u32),
-    // TODO: Why does simple.rs use FileKind and not just fuser::FileType?
     pub kind: FileKind,
     // Permissions and special mode bits
     pub mode: u16,
@@ -101,13 +101,7 @@ struct InodeAttributes {
     pub extent_indirect: u64,
 }
 
-// table/map with inodes (inode number -> inode structure)
-// Options for inode table data structure:
-// - hashmap
-// - b-tree
-// - flat data structure: vector or array
-// NOTE: Let's start with a flat data structure. This should be sized
-// according to the max # of inodes allowed in the inode bitmap, i.e 32K.
+// Table (flat data structure: a vector) with inodes.
 type InodeTable = Vec<InodeAttributes>;
 
 struct FuseFS {
@@ -127,8 +121,8 @@ impl FuseFS {
         let superblock = Superblock::new(block_size, num_inodes, num_blocks);
         // TODO: Check if this syntax actually does what you want it to do.
         let inode_bitmap = vec![Bitmap::<1024>::new(); num_inodes as usize / 1024];
-        let data_bitmap = vec![Bitmap::<1024>::new; num_blocks as usize / 1024];
-        let inode_table = vec!;
+        let data_bitmap = vec![Bitmap::<1024>::new(); num_blocks as usize / 1024];
+        let inode_table = vec![InodeAttributes::default(); num_inodes as usize];
         FuseFS {
             superblock,
             inode_bitmap,
@@ -138,8 +132,16 @@ impl FuseFS {
         }
     }
 
+    // TODO: Do this stuff after we get space allocation and serialization and
+    // deserialization figured out. OK, or just figure out some of the basic
+    // serialization/deserialization stuff to get this working.
     fn load(fd: File) -> FuseFS {
         // Read file superblock
+        let mut sb_buf = [0; size_of::<Superblock>()];
+        let _ = match fd.read(&mut sb_buf) {
+            Ok(n) => n,
+            Err(e) => panic!("could not read from backing file with error: {}", e),
+        };
         // Read in all data needed to re-create the filesystem
         // Return the loaded filesystem; crash if ill-formatted
     }
@@ -213,7 +215,7 @@ struct Args {
 fn valid_block_size(s: &str) -> Result<u32, String> {
     let bl_size: usize = s.parse().map_err(|_| format!("`{s}` is not a number"))?;
     if bl_size % 412 == 0 {
-        Ok(bm_size as u32)
+        Ok(bl_size as u32)
     } else {
         Err(format!("`{s}` must be a multiple of 412"))
     }
@@ -287,8 +289,8 @@ fn main() {
         eprintln!("Unable to read /etc/fuse.conf");
     }
 
-    if (cfg.mount_options.contains(&MountOption::AutoUnmount) &&
-        cfg.acl != SessionACL::RootAndOwner)
+    if cfg.mount_options.contains(&MountOption::AutoUnmount) &&
+        cfg.acl != SessionACL::RootAndOwner
     {
         cfg.acl = SessionACL::All;
     }
@@ -307,13 +309,17 @@ fn main() {
         info!("loading existing filesystem");
         match File::open(block_file) {
             Ok(f) => FuseFS::load(f),
-            Err(e) => panic!(e),
+            Err(e) => panic!("could not open file {} with error: {}",
+                             block_file.display(),
+                             e.to_string()),
         }
     } else {
-        info!(format!("creating new filesystem at {}", block_file));
+        info!("creating new filesystem at {}", block_file.display());
         match File::create(block_file) {
             Ok(f) => FuseFS::new(f, block_size, num_inodes, num_blocks),
-            Err(e) => panic!(e),
+            Err(e) => panic!("could not create file {} with error: {}",
+                             block_file.display(),
+                             e.to_string()),
         }
     };
 
