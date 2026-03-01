@@ -1,19 +1,34 @@
 use std::fs::File;
-use std::mem;
+use std::io;
+use std::io::ErrorKind;
+use std::io::BufReader;
+use std::io::BufRead;
 use std::path::PathBuf;
 use std::path::Path;
 use bitmaps::Bitmap;
-use std::os::unix::fs::FileExt; //for read write
+use std::os::unix::fs::FileExt;
 use clap::Parser;
 
 use log::LevelFilter;
 use log::debug;
 use log::error;
 use log::info;
-use log::warn;
+// use log::warn;
 
 use serde::Deserialize;
 use serde::Serialize;
+
+use fuser::Filesystem;
+use fuser::SessionACL;
+use fuser::MountOption;
+use fuser::Request;
+use fuser::INodeNo;
+use fuser::FileHandle;
+use fuser::OpenFlags;
+use fuser::LockOwner;
+use fuser::ReplyData;
+use fuser::Config;
+
 
 const FSID: u32 = 0x55555;
 
@@ -35,7 +50,9 @@ struct Superblock {
 impl Superblock {
     fn new(block_size: u32, num_inodes: u64, num_blocks: u64) {
         // Use std::mem.size_of to get an aligned size calculation.
-        let sb_size = size_of<Superblock>();
+        let sb_size = size_of::<Superblock>() as u64;
+        let it_start = sb_size + (num_inodes / 8) + (num_blocks / 8);
+        let da_start = it_start + (size_of::<InodeAttributes>() as u64) * num_inodes;
         Superblock {
             fsid: FSID,
             block_size,
@@ -44,14 +61,21 @@ impl Superblock {
             bitmap_start: sb_size,
             // We divide by 8 since addresses (basically pointers to locations
             // in a file) are in terms of bytes (not bits).
-            itable_start: bitmap_start + (num_inodes / 8) + (num_blocks / 8),
-            data_start: itable_start + size_of<InodeAttributes>() * num_inodes,
+            itable_start: it_start,
+            data_start: da_start,
         };
     }
 }
 
 // The first value is the start location; the second value is the extent length.
 type Extent = (u64, u64);
+
+#[derive(Serialize, Deserialize, Copy, Clone, PartialEq)]
+enum FileKind {
+    File,
+    Directory,
+    Symlink,
+}
 
 // inode structure
 // -- pointers to data blocks
@@ -84,12 +108,12 @@ struct InodeAttributes {
 // - flat data structure: vector or array
 // NOTE: Let's start with a flat data structure. This should be sized
 // according to the max # of inodes allowed in the inode bitmap, i.e 32K.
-type InodeTable = [InodeAttributes];
+type InodeTable = Vec<InodeAttributes>;
 
 struct FuseFS {
     superblock: Superblock,
-    inode_bitmap: [Bitmap],
-    data_bitmap: [Bitmap],
+    inode_bitmap: Vec<Bitmap<1024>>,
+    data_bitmap: Vec<Bitmap<1024>>,
     inode_table: InodeTable,
     block_store_fd: File,
 }
@@ -102,9 +126,9 @@ impl FuseFS {
         debug!("Creating filesystem..");
         let superblock = Superblock::new(block_size, num_inodes, num_blocks);
         // TODO: Check if this syntax actually does what you want it to do.
-        let inode_bitmap = [Bitmap<1024>(); (num_inodes / 1024)];
-        let data_bitmap = [Bitmap<1024>(); (num_blocks / 1024)];
-        let inode_table = [InodeAttributes; num_inodes];
+        let inode_bitmap = vec![Bitmap::<1024>::new(); num_inodes as usize / 1024];
+        let data_bitmap = vec![Bitmap::<1024>::new; num_blocks as usize / 1024];
+        let inode_table = vec!;
         FuseFS {
             superblock,
             inode_bitmap,
@@ -204,20 +228,6 @@ fn valid_bitmap_size(s: &str) -> Result<u64, String> {
     }
 }
 
-fn port_in_range(s: &str) -> Result<u16, String> {
-    let port: usize = s
-        .parse()
-        .map_err(|_| format!("`{s}` isn't a port number"))?;
-    if PORT_RANGE.contains(&port) {
-        Ok(port as u16)
-    } else {
-        Err(format!(
-            "port not in range {}-{}",
-            PORT_RANGE.start(),
-            PORT_RANGE.end()
-        ))
-    }
-}
 // Reads directly from /etc/fuse.conf file for additional configuration
 // regarding mount policy. Currently, reads the user_allow_other option (if
 // present), which allows non-root users to specify allow_other or allow_root
@@ -307,7 +317,7 @@ fn main() {
         }
     };
 
-    let result = fuser::mount(fs, &args.mount_point, &cfg);
+    let result = fuser::mount2(fs, &args.mount_point, &cfg);
     if let Err(e) = result {
         // Return a special error code for permission denied, which usually
         // indicates that "user_allow_other" is missing from /etc/fuse.conf
