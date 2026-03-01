@@ -23,6 +23,7 @@ The first filesystem is an extremely minimal implementation in the style of vsfs
 9. Implement file renames.
 10. Go through rest of fuser Filesystem implementation, fill out other functions.
 11. Work through and fix edge cases, i.e. out-of-space errors.
+12. (Implement a basic, but somewhat intelligent data placement heuristic.)
 
 ## journalFS
 An extension of minimalFS with journaling for a form of crash-recovery/consistency.

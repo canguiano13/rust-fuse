@@ -1,5 +1,7 @@
 use std::fs::File;
 use std::mem;
+use std::path::PathBuf;
+use std::path::Path;
 use bitmaps::Bitmap;
 use std::os::unix::fs::FileExt; //for read write
 use clap::Parser;
@@ -9,6 +11,9 @@ use log::debug;
 use log::error;
 use log::info;
 use log::warn;
+
+use serde::Deserialize;
+use serde::Serialize;
 
 const FSID: u32 = 0x55555;
 
@@ -50,19 +55,17 @@ type Extent = (u64, u64);
 
 // inode structure
 // -- pointers to data blocks
-// TODO: Figure out what's happening here with the derive thing --- was it assuming
-// use of the serde crate? Also, we need to figure out how to get the exact size
-// after serialization for these inode structures so we can properly compute
-// offset values for data blocks.
 #[derive(Serialize, Deserialize)]
 struct InodeAttributes {
     pub inode: u64,
-    pub open_file_handles: u64, // Ref count of open file handles to this inode
+    // Ref count of open file handles to this inode
+    pub open_file_handles: u64,
     pub size: u64,
     pub last_accessed: (i64, u32),
     pub last_modified: (i64, u32),
     pub last_metadata_changed: (i64, u32),
-    pub kind: FileKind, // TODO: Why does simple.rs use FileKind and not just fuser::FileType?
+    // TODO: Why does simple.rs use FileKind and not just fuser::FileType?
+    pub kind: FileKind,
     // Permissions and special mode bits
     pub mode: u16,
     pub hardlinks: u32,
@@ -91,38 +94,39 @@ struct FuseFS {
     block_store_fd: File,
 }
 
+// Implement methods specific to FuseFS design and structure.
 impl FuseFS {
-    fn new(block_size: u32, num_inodes: u64, num_blocks: u64, store_fp: str) -> Result<FuseFS> {
+    // TODO: Use PathBuf here instead of string.
+    // TODO: Am I supposed to have a dedicated Error component to the Result type?
+    fn new(fd: File, block_size: u32, num_inodes: u64, num_blocks: u64) -> FuseFS {
         debug!("Creating filesystem..");
         let superblock = Superblock::new(block_size, num_inodes, num_blocks);
         // TODO: Check if this syntax actually does what you want it to do.
         let inode_bitmap = [Bitmap<1024>(); (num_inodes / 1024)];
         let data_bitmap = [Bitmap<1024>(); (num_blocks / 1024)];
         let inode_table = [InodeAttributes; num_inodes];
-        let block_store_fd = File::create(store_fp)?;
         FuseFS {
             superblock,
             inode_bitmap,
             data_bitmap,
             inode_table,
-            block_store_fd,
+            block_store_fd: fd,
         }
     }
 
-    fn load(store_fp: str) -> Result<FuseFS> {
+    fn load(fd: File) -> FuseFS {
         // Read file superblock
         // Read in all data needed to re-create the filesystem
-        // Return the loaded filesystem
+        // Return the loaded filesystem; crash if ill-formatted
     }
 }
 
-// for FUSE:
-// - implement the Filesystem trait
-// - do basic setup stuff in main()
+// Implement the Filesystem trait to integrate FuseFS with fuser.
 impl Filesystem for FuseFS {
     // TODO: Fill out this stuff.
     // Adding read and write
-    fn read(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64, size: u32, _flags: OpenFlags, _lock: Option<LockOwner>, reply: ReplyData) {
+    fn read(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64,
+            size: u32, _flags: OpenFlags, _lock: Option<LockOwner>, reply: ReplyData) {
         // check if inode really exist
         if !self.inode_bitmap.get(ino.0 as usize) {
             // If the bit is 0, file doesn't exist
@@ -136,7 +140,8 @@ impl Filesystem for FuseFS {
         // create buffer, value starts at 0, type is u8
         let mut buffer = vec![0u8; size as usize];
 
-        // Adding file to buffer at exact offset address, check if read is successful and return data, otherwise just return error
+        // Adding file to buffer at exact offset address, check if read is
+        // successful and return data, otherwise just return error
         match self.block_store_fd.read_at(&mut buffer, file_base_address + offset as u64) {
             Ok(bytes_read) => reply.data(&buffer[..bytes_read]),
             Err(_) => reply.error(libc::EIO),
@@ -145,54 +150,93 @@ impl Filesystem for FuseFS {
 }
 
 #[derive(Parser)]
-#[command(version, author = "Lucas Du, Carlos Anguiano, Simon Zheng")]
-// TODO: Need to add to this.
+#[command(version, author = "Carlos Anguiano, Lucas Du, Simon Zheng")]
 struct Args {
-    /// Set local directory used to store data
-    #[clap(long, default_value = "/tmp/fuser")]
-    data_dir: String,
-
-    // TODO: make positional like other examples.
     /// Act as a client, and mount FUSE at given path
-    #[clap(long, default_value = "")]
-    mount_point: String,
+    mount_point: PathBuf,
+
+    /// Declares the name of the backing filestore
+    block_file: PathBuf,
 
     /// Mount FUSE with direct IO
-    #[clap(long, requires = "mount_point")]
+    #[arg(long, requires = "mount_point")]
     direct_io: bool,
 
     /// Automatically unmount FUSE when process exits
-    #[clap(long)]
+    #[arg(long)]
     auto_unmount: bool,
 
-    /// Run a filesystem check
-    #[clap(long)]
-    fsck: bool,
-
     /// Enable setuid support when run as root
-    #[clap(long)]
+    #[arg(long)]
     suid: bool,
 
-    #[clap(long, default_value_t = 1)]
+    #[arg(long, default_value_t = 1)]
     n_threads: usize,
 
     /// Sets the level of verbosity
-    #[clap(short, action = clap::ArgAction::Count)]
+    #[arg(short, action = clap::ArgAction::Count)]
     v: u8,
 
-    #[clap(long, default_value_t = 4096)]
+    #[arg(long, default_value_t = 4096, value_parser = valid_block_size)]
     block_size: u32,
 
-    // TODO: Add in num inodes and blocks bitmaps.
+    #[arg(long, default_value_t = 32768, value_parser = valid_bitmap_size)]
+    num_inodes: u64,
+    #[arg(long, default_value_t = 32768, value_parser = valid_bitmap_size)]
+    num_blocks: u64,
 }
 
+fn valid_block_size(s: &str) -> Result<u32, String> {
+    let bl_size: usize = s.parse().map_err(|_| format!("`{s}` is not a number"))?;
+    if bl_size % 412 == 0 {
+        Ok(bm_size as u32)
+    } else {
+        Err(format!("`{s}` must be a multiple of 412"))
+    }
+}
+
+fn valid_bitmap_size(s: &str) -> Result<u64, String> {
+    let bm_size: usize = s.parse().map_err(|_| format!("`{s}` is not a number"))?;
+    if bm_size % 1024 == 0 {
+        Ok(bm_size as u64)
+    } else {
+        Err(format!("`{s}` must be a multiple of 1024"))
+    }
+}
+
+fn port_in_range(s: &str) -> Result<u16, String> {
+    let port: usize = s
+        .parse()
+        .map_err(|_| format!("`{s}` isn't a port number"))?;
+    if PORT_RANGE.contains(&port) {
+        Ok(port as u16)
+    } else {
+        Err(format!(
+            "port not in range {}-{}",
+            PORT_RANGE.start(),
+            PORT_RANGE.end()
+        ))
+    }
+}
+// Reads directly from /etc/fuse.conf file for additional configuration
+// regarding mount policy. Currently, reads the user_allow_other option (if
+// present), which allows non-root users to specify allow_other or allow_root
+// mount options.
+fn fuse_allow_other_enabled() -> io::Result<bool> {
+    let file = File::open("/etc/fuse.conf")?;
+    for line in BufReader::new(file).lines() {
+        if line?.trim_start().starts_with("user_allow_other") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
 
 fn main() {
+    // Initialize clap parser for Args struct.
     let args = Args::parse();
-    // TODO: One of the arguments here should be the name of the file to allocate
-    // as the backing "block store" for our filesystem. I guess this file could
-    // have any suffix, although it would be nice to enforce a .fs format name.
 
+    // Set up default logging framework.
     let log_level = match args.v {
         0 => LevelFilter::Error,
         1 => LevelFilter::Warn,
@@ -205,17 +249,26 @@ fn main() {
         .filter_level(log_level)
         .init();
 
-
+    // Initialize Config struct (from fuser) for FUSE configuration knobs.
     let mut cfg = Config::default();
     cfg.mount_options = vec![MountOption::FSName("fuser".to_string())];
 
+    // Handle CLI arguments.
+    // NOTE: Many of these CLI arguments are used to push values into Config
+    // mount_options Vec. The Config struct is then directly used in the call
+    // to fuser::mount.
     if args.suid {
         info!("setuid bit support enabled");
         cfg.mount_options.push(MountOption::Suid);
     }
+
     if args.auto_unmount {
         cfg.mount_options.push(MountOption::AutoUnmount);
     }
+
+    // We require that user_allow_other is set in /etc/fuse.conf. This, I
+    // believe, is necessary for a non-root user to actually mount and use the
+    // FUSE filesystem.
     if let Ok(enabled) = fuse_allow_other_enabled() {
         if enabled {
             cfg.acl = SessionACL::All;
@@ -223,21 +276,41 @@ fn main() {
     } else {
         eprintln!("Unable to read /etc/fuse.conf");
     }
-    if cfg.mount_options.contains(&MountOption::AutoUnmount) && cfg.acl != SessionACL::RootAndOwner
+
+    if (cfg.mount_options.contains(&MountOption::AutoUnmount) &&
+        cfg.acl != SessionACL::RootAndOwner)
     {
         cfg.acl = SessionACL::All;
     }
 
     cfg.n_threads = Some(args.n_threads);
 
-    let result = fuser::mount(
-        SimpleFS::new(args.data_dir, args.direct_io, args.suid),
-        &args.mount_point,
-        &cfg,
-    );
+    let block_size = args.block_size;
+    let num_inodes = args.num_inodes;
+    let num_blocks = args.num_blocks;
+
+    // Check if the backing filestore exists. If it does, attempt to load the
+    // existing filesystem. Otherwise, create a new file as the backing store.
+    let block_file: &Path = args.block_file.as_path();
+    let fs = if block_file.exists() {
+        info!("specified filesystem already exists");
+        info!("loading existing filesystem");
+        match File::open(block_file) {
+            Ok(f) => FuseFS::load(f),
+            Err(e) => panic!(e),
+        }
+    } else {
+        info!(format!("creating new filesystem at {}", block_file));
+        match File::create(block_file) {
+            Ok(f) => FuseFS::new(f, block_size, num_inodes, num_blocks),
+            Err(e) => panic!(e),
+        }
+    };
+
+    let result = fuser::mount(fs, &args.mount_point, &cfg);
     if let Err(e) = result {
-        // Return a special error code for permission denied, which usually indicates that
-        // "user_allow_other" is missing from /etc/fuse.conf
+        // Return a special error code for permission denied, which usually
+        // indicates that "user_allow_other" is missing from /etc/fuse.conf
         if e.kind() == ErrorKind::PermissionDenied {
             error!("{e}");
             std::process::exit(2);
