@@ -149,6 +149,101 @@ impl FuseFS {
         // Temporary stub until deserialization is implemented
         FuseFS::new(fd, 4096, 32768, 32768)
     }
+
+
+    // TODO search for next free space in the inode table using bitmap
+    // if space is available, return the offset of the free block from the start of data region
+    // return None if there is no space in the data region
+    fn next_free_inode(&self) -> Option<u64> { 
+        // search one bitmap chunk at a time
+        for (chunk_idx, chunk) in self.inode_bitmap.iter().enumerate(){
+            // check each bit until we find a free space
+            let mut i = 0;
+            while chunk.get(i){
+                i += 1
+            }
+
+            // check that it's actually free and not that the entire chunk is allocated
+            if i < 1024 && !chunk.get(i){
+                return Some(((chunk_idx * 1024) + i) as u64);
+            }
+        }
+
+        //no free spots
+        return None;
+    }
+
+    // TODO search for next free space in the data region using bitmap
+    // if space is available, return the offset of the free block from the start of data region
+    // return None if there is no space in the data region
+    fn next_free_block(&self) -> Option<u64> { 
+        // search one bitmap chunk at a time
+        for (chunk_idx, chunk) in self.data_bitmap.iter().enumerate(){
+            // check each bit until we find a free space
+            let mut i = 0;
+            while chunk.get(i){
+                i += 1
+            }
+
+            // check that it's actually free and not that the entire chunk is allocated
+            if i < 1024 && !chunk.get(i){
+                return Some(((chunk_idx * 1024) + i) as u64);
+            }
+        }
+
+        //no free spots
+        return None;
+    }
+
+    // TODO allocate an inode basd on available space in the inode table
+    fn allocate_inode(&mut self) -> Option<u64>{
+        // get the index of the next free inode
+        let free_idx = self.next_free_inode();
+
+        //
+        if let Some(idx) = free_idx{
+            // allocate it
+            //TODO need to make some logic to create an inode
+    
+            // mark it as allocated
+            let chunk = (idx / 1024) as usize; // compiler doesn't like it without casting for some reason??
+            let bit = (idx % 1024) as usize;
+            self.inode_bitmap[chunk].set(bit, true);
+
+            // return the location that the data was allocated at
+            return Some(idx);
+
+        } else{
+            // no free space available in inode table
+            return None
+        }
+    }
+
+
+    // TODO allocate data block based on available space in the data region
+    fn allocate_block(&mut self) -> Option<u64>{
+        // get the index of the next free data block 
+        let free_idx = self.next_free_block();
+
+        if let Some(idx) = free_idx{
+            // allocate block it
+            //TODO need to make some logic to write to data region
+    
+            // mark it as allocated
+            let chunk = (idx / 1024) as usize; // compiler doesn't like it without casting for some reason??
+            let bit = (idx % 1024) as usize;
+            self.data_bitmap[chunk].set(bit, true);
+
+            // return the location that the data was allocated at
+            return Some(idx);
+
+        } else{
+            // no free space available in data region
+            return None
+        }
+    }
+
+
 }
 
 // Implement the Filesystem trait to integrate FuseFS with fuser.
