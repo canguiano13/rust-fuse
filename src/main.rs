@@ -29,6 +29,7 @@ use fuser::OpenFlags;
 use fuser::LockOwner;
 use fuser::ReplyData;
 use fuser::Config;
+use fuser::Errno;
 
 const FSID: u32 = 0x55555;
 
@@ -72,7 +73,7 @@ type Extent = (u64, u64);
 
 // TODO: Why does simple.rs use FileKind and not just fuser::FileType? Should
 // we continue to do this?
-#[derive(Serialize, Deserialize, Copy, Clone, PartialEq, Default)]
+#[derive(Serialize, Deserialize, Copy, Clone, PartialEq, Default, Debug)]
 enum FileKind {
     #[default]
     File,
@@ -135,7 +136,7 @@ impl FuseFS {
     // TODO: Do this stuff after we get space allocation and serialization and
     // deserialization figured out. OK, or just figure out some of the basic
     // serialization/deserialization stuff to get this working.
-    fn load(fd: File) -> FuseFS {
+    fn load(mut fd: File) -> FuseFS {
         // Read file superblock
         let mut sb_buf = [0; size_of::<Superblock>()];
         let _ = match fd.read(&mut sb_buf) {
@@ -144,19 +145,122 @@ impl FuseFS {
         };
         // Read in all data needed to re-create the filesystem
         // Return the loaded filesystem; crash if ill-formatted
+
+        // Temporary stub until deserialization is implemented
+        FuseFS::new(fd, 4096, 32768, 32768)
     }
 }
 
 // Implement the Filesystem trait to integrate FuseFS with fuser.
 impl Filesystem for FuseFS {
     // TODO: Fill out this stuff.
+
+    //Adding init
+    fn init(&mut self, _req: &Request, _config: &mut fuser::KernelConfig) -> Result<(), std::io::Error> {
+        info!("Filesystem mounted successfully");
+
+        // Set up root directory as inode 1
+        let root_inode = 1usize;
+        let chunk = root_inode / 1024;
+        let bit = root_inode % 1024;
+        self.inode_bitmap[chunk].set(bit, true);
+        self.inode_table[root_inode] = InodeAttributes {
+            inode: root_inode as u64,
+            size: 0,
+            kind: FileKind::Directory,
+            mode: 0o755,
+            hardlinks: 2,
+            uid: 0,
+            gid: 0,
+            ..Default::default()
+        };
+        Ok(())
+    }
+
+    // Add getattr
+    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: fuser::ReplyAttr) {
+        let chunk = ino.0 as usize / 1024;
+        let bit = ino.0 as usize % 1024;
+
+        // Check if inode is allocated in the bitmap
+        match self.inode_bitmap.get(chunk) {
+            None => {
+                reply.error(Errno::ENOENT);
+                return;
+            }
+            Some(bitmap) => {
+                if !bitmap.get(bit) {
+                    reply.error(Errno::ENOENT);
+                    return;
+                }
+            }
+        }
+
+        // Look up the inode in the table
+        let inode = &self.inode_table[ino.0 as usize];
+
+        let kind = match inode.kind {
+            FileKind::File => fuser::FileType::RegularFile,
+            FileKind::Directory => fuser::FileType::Directory,
+            FileKind::Symlink => fuser::FileType::Symlink,
+        };
+
+        let attrs = fuser::FileAttr {
+            ino: ino,
+            size: inode.size,
+            blocks: (inode.size + self.superblock.block_size as u64 - 1)
+                / self.superblock.block_size as u64,
+            atime: std::time::UNIX_EPOCH
+                + std::time::Duration::new(inode.last_accessed.0 as u64, inode.last_accessed.1),
+            mtime: std::time::UNIX_EPOCH
+                + std::time::Duration::new(inode.last_modified.0 as u64, inode.last_modified.1),
+            ctime: std::time::UNIX_EPOCH
+                + std::time::Duration::new(inode.last_metadata_changed.0 as u64, inode.last_metadata_changed.1),
+            crtime: std::time::UNIX_EPOCH,
+            kind,
+            perm: inode.mode,
+            nlink: inode.hardlinks,
+            uid: inode.uid,
+            gid: inode.gid,
+            rdev: 0,
+            blksize: self.superblock.block_size,
+            flags: 0,
+        };
+
+        reply.attr(&std::time::Duration::from_secs(1), &attrs);
+    }
+
+    fn readdir(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64, mut reply: fuser::ReplyDirectory) {
+        // Only handle the root directory for now
+        if ino.0 != 1 {
+            reply.error(Errno::ENOENT);
+            return;
+        }
+
+        // Every directory needs these two entries
+        let entries = vec![
+            (INodeNo(1), fuser::FileType::Directory, "."),
+            (INodeNo(1), fuser::FileType::Directory, ".."),
+        ];
+
+        // offset tells us where to resume listing from
+        for (i, (inode, kind, name)) in entries.iter().enumerate().skip(offset as usize) {
+            if reply.add(*inode, (i + 1) as u64, *kind, name) {
+                // Buffer is full, stop adding entries
+                break;
+            }
+        }
+
+        reply.ok();
+    }
+
     // Adding read and write
     fn read(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64,
             size: u32, _flags: OpenFlags, _lock: Option<LockOwner>, reply: ReplyData) {
         // check if inode really exist
-        if !self.inode_bitmap.get(ino.0 as usize) {
+        if self.inode_bitmap.get(ino.0 as usize).is_none() {
             // If the bit is 0, file doesn't exist
-            reply.error(libc::ENOENT);
+            reply.error(Errno::ENOENT);
             return;
         }
 
@@ -170,7 +274,7 @@ impl Filesystem for FuseFS {
         // successful and return data, otherwise just return error
         match self.block_store_fd.read_at(&mut buffer, file_base_address + offset as u64) {
             Ok(bytes_read) => reply.data(&buffer[..bytes_read]),
-            Err(_) => reply.error(libc::EIO),
+            Err(_) => reply.error(Errno::EIO),
         }
     }
 }
@@ -214,7 +318,7 @@ struct Args {
 
 fn valid_block_size(s: &str) -> Result<u32, String> {
     let bl_size: usize = s.parse().map_err(|_| format!("`{s}` is not a number"))?;
-    if bl_size % 412 == 0 {
+    if bl_size % 4096 == 0 {
         Ok(bl_size as u32)
     } else {
         Err(format!("`{s}` must be a multiple of 412"))
@@ -334,4 +438,107 @@ fn main() {
             error!("{e}");
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_superblock_layout() {
+        let sb = Superblock::new(4096, 1024, 1024);
+        assert_eq!(sb.fsid, FSID);
+        assert_eq!(sb.block_size, 4096);
+        // bitmap_start should be immediately after the superblock
+        assert_eq!(sb.bitmap_start, size_of::<Superblock>() as u64);
+        // inode table should start after both bitmaps
+        let expected_itable = sb.bitmap_start + (1024 / 8) + (1024 / 8);
+        assert_eq!(sb.itable_start, expected_itable);
+        // data should start after the inode table
+        let expected_data = sb.itable_start + size_of::<InodeAttributes>() as u64 * 1024;
+        assert_eq!(sb.data_start, expected_data);
+    }
+
+    #[test]
+    fn test_new_filesystem_creation() {
+        let tmp = NamedTempFile::new().unwrap();
+        let fd = tmp.reopen().unwrap();
+        let fs = FuseFS::new(fd, 4096, 1024, 1024);
+
+        assert_eq!(fs.superblock.block_size, 4096);
+        assert_eq!(fs.superblock.num_inodes, 1024);
+        assert_eq!(fs.superblock.num_blocks, 1024);
+        // All inodes should be unallocated initially
+        assert_eq!(fs.inode_table.len(), 1024);
+        assert!(fs.inode_table.iter().all(|i| i.inode == 0));
+    }
+
+    #[test]
+    fn test_valid_block_size_accepts_multiples_of_4096() {
+        assert!(valid_block_size("4096").is_ok());
+        assert!(valid_block_size("500").is_err());
+    }
+
+    #[test]
+    fn test_valid_bitmap_size_accepts_multiples_of_1024() {
+        assert!(valid_bitmap_size("1024").is_ok());
+        assert!(valid_bitmap_size("32768").is_ok());
+        assert!(valid_bitmap_size("500").is_err());
+    }
+
+    #[test]
+    fn test_inode_attributes_default() {
+        let inode = InodeAttributes::default();
+        assert_eq!(inode.kind, FileKind::File);
+        assert_eq!(inode.size, 0);
+        assert_eq!(inode.hardlinks, 0);
+    }
+
+    #[test]
+    fn test_getattr_unallocated_inode_returns_none() {
+        let tmp = NamedTempFile::new().unwrap();
+        let fd = tmp.reopen().unwrap();
+        let fs = FuseFS::new(fd, 4096, 1024, 1024);
+
+        // No inodes allocated yet, every bit should be unset
+        let chunk = 0;
+        let bit = 0;
+        assert!(!fs.inode_bitmap[chunk].get(bit), "bitmap should be empty on a new filesystem");
+    }
+
+    #[test]
+    fn test_readdir_root_inode_is_directory() {
+        let tmp = NamedTempFile::new().unwrap();
+        let fd = tmp.reopen().unwrap();
+        let mut fs = FuseFS::new(fd, 4096, 1024, 1024);
+
+        // Simulate what init() does - set up root inode
+        let root_inode = 1usize;
+        let chunk = root_inode / 1024;
+        let bit = root_inode % 1024;
+        fs.inode_bitmap[chunk].set(bit, true);
+        fs.inode_table[root_inode] = InodeAttributes {
+            inode: root_inode as u64,
+            size: 0,
+            kind: FileKind::Directory,
+            mode: 0o755,
+            hardlinks: 2,
+            uid: 0,
+            gid: 0,
+            ..Default::default()
+        };
+
+        // Verify root inode is allocated in bitmap
+        assert!(fs.inode_bitmap[chunk].get(bit), "root inode should be allocated");
+
+        // Verify root inode is a directory
+        assert_eq!(fs.inode_table[root_inode].kind, FileKind::Directory);
+
+        // Verify root inode has correct hardlinks (. and ..)
+        assert_eq!(fs.inode_table[root_inode].hardlinks, 2);
+
+        // Verify permissions
+        assert_eq!(fs.inode_table[root_inode].mode, 0o755);
+    }   
 }
