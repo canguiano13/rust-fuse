@@ -535,7 +535,7 @@ mod tests {
         // Verify root inode is a directory
         assert_eq!(fs.inode_table[root_inode].kind, FileKind::Directory);
 
-        // Verify root inode has correct hardlinks (. and ..)
+        // Verify root inode has correct hardlinks
         assert_eq!(fs.inode_table[root_inode].hardlinks, 2);
 
         // Verify permissions
