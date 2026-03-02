@@ -12,12 +12,12 @@ The first filesystem is an extremely minimal implementation in the style of vsfs
 - No support for xattrs.
 
 ### to-dos (by Sunday 3/1/26!)
-1. Get configuration set up for various filesystem knobs, implement filesystem initialization function.
+1. Get configuration set up for various filesystem knobs, implement filesystem initialization function. (done?)
 2. Write up helper functions for allocating space on the "block storage" file.
 3. Add in serialization and implement calculation for offset/"address" calculation.
 4. Implement file allocation flow: checks in inode and data bitmaps, block allocation.
-5. Implement file read and writes, including metadata changes.
-6. Implement directory management.
+5. Implement file read and writes, including metadata changes. 
+6. Implement directory management. 
 7. Implement link counters and then file deletes.
 8. Implement basic access control with modes and UID/GID.
 9. Implement file renames.
