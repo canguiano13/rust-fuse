@@ -1,0 +1,3 @@
+- Implement/define an API for all important functions for Carlos and Simon to program against.
+- Implement the serialization stuff using serde_json: two separate files, write to store immediately, only write metadata from memory to the metadata file when filesystem is unmounted/closed (and also on initial startup) to keep things simple.
+- Implement own bitmap representation, or figure out how to serialize Bitmap from the external library.
