@@ -21,8 +21,8 @@ use bitmaps::Bitmap;
 
 use serde::Deserialize;
 use serde::Serialize;
-use serde::Serializer;
-use serde::Deserializer;
+// use serde::Serializer;
+// use serde::Deserializer;
 
 use fuser::Filesystem;
 use fuser::SessionACL;
@@ -39,7 +39,7 @@ const FSID: u32 = 0x55555;
 const META_FILE_NAME: &str = "meta.fs";
 const STORE_FILE_NAME: &str = "store.fs";
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 struct Superblock {
     // Magic number identifying the file system.
     fsid: u32,
@@ -97,40 +97,8 @@ struct InodeAttributes {
 // Table (flat data structure: a vector) with inodes.
 type InodeTable = Vec<InodeAttributes>;
 
-// Implement local, serializable version of Bitmap
-// struct FormattedDate(Date<Utc>);
-
-// impl Serialize for FormattedDate {
-//     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-//     where
-//         S: Serializer,
-//     {
-//         // If you implement `Deref`, then you don't need to add `.0`
-//         let s = format!("{}", self.0.format(SERIALIZE_FORMAT));
-//         serializer.serialize_str(&s)
-//     }
-// }
-
-// impl<'de> Deserialize<'de> for FormattedDate {
-//     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-//     where
-//         D: Deserializer<'de>,
-//     {
-//         let s = String::deserialize(deserializer)?;
-//         NaiveDate::parse_from_str(s.as_str(), SERIALIZE_FORMAT)
-//             .map_err(serde::de::Error::custom)
-//             .map(|x| {
-//                 let now = Utc::now();
-//                 let date: Date<Utc> = Date::from_utc(x, now.offset().clone());
-//                 Self(date)
-//                 // or
-//                 // date.into()
-//             })
-//     }
-// }
-
-#[derive(PartialOrd, Ord, PartialEq, Eq, Clone, Debug, Serialize, Deserialize)]
-struct FSBitmap(Bitmap<1024>);
+// #[derive(PartialOrd, Ord, PartialEq, Eq, Clone, Debug, Serialize, Deserialize)]
+// struct FSBitmap(Bitmap<1024>);
 
 // TODO: You might just need to implement your own bitmap. This seems very
 // painful. OK, or here's a hack: just iterate over each set bit in the bitmap
@@ -141,43 +109,130 @@ struct FSBitmap(Bitmap<1024>);
 // function that converts the regular Meta struct to one that's serializable
 // (basically just bitmaps converted in the way described above) and then
 // directly call serialize on that.
-impl Serialize for FSBitmap {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        // TODO: Check to see if this actually does what you expect.
-        let array_v: [u128; 8] = Bitmap::from(self.0).into();
-        // serializer.serialize_bytes(self.into_value())
-        let mut seq = serializer.serialize_seq(Some(self.len()))?;
-        for e in array_v {
-            seq.serialize_element(e)?;
-        }
-        seq.end()
-    }
-}
+// The alternative is also just to say fuck it and either create bitmaps out of
+// bools or just serialize to a vec of bools.
+// NOTE UPDATE (March 4, 2026): Said fuck it.
+// impl Serialize for FSBitmap {
+//     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+//     where
+//         S: Serializer,
+//     {
+//         let mut u8vec: Vec<u8>;
+//         let max_bit_index = match self.last_index() {
+//             None => return
+//         };
+//         let u8_bit_i = 0;
+//         let u8_construct = 0;
+//         for i in 0..(max_bit_index+1) {
+//             if self.get(i) {
 
-// Helper functions to make dealing with the wrapped version of Bitmap easier.
-use std::ops::{Deref, DerefMut};
-impl Deref for FSBitmap {
-    type Target = Bitmap<1024>;
+//             } else {
 
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-impl DerefMut for FSBitmap {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
+//             }
+//         }
+
+//     }
+// }
+
+// // Helper functions to make dealing with the wrapped version of Bitmap easier.
+// use std::ops::{Deref, DerefMut};
+// impl Deref for FSBitmap {
+//     type Target = Bitmap<1024>;
+
+//     fn deref(&self) -> &Self::Target {
+//         &self.0
+//     }
+// }
+// impl DerefMut for FSBitmap {
+//     fn deref_mut(&mut self) -> &mut Self::Target {
+//         &mut self.0
+//     }
+// }
+
+// NOTE: Let's just do something very stupid and hacky for now, and convert all
+// Bitmaps into vectors of u8s, then just directly call serde_json serialization
+// on that (which should work out-of-the-box). Ideally, we would have a custom
+// serializer (i.e see above), but...I can't be bothered right now. I just want
+// serialization to work so that at least we can persist to disk.
 
 #[derive(Serialize, Deserialize)]
+struct MetaSerializable {
+    superblock: Superblock,
+    // NOTE: It would actually be great to have a u8 vec for higher data density,
+    // but I'm really strapped for time and don't want to deal with even the
+    // minor complexity of conversion from bits to u8. So bools it is!
+    inode_bitmap: Vec<bool>,
+    data_bitmap: Vec<bool>,
+    inode_table: InodeTable,
+}
+
+impl MetaSerializable {
+    fn to_meta(&self) -> Meta {
+        let inode_bitmap_len = usize::try_from(self.superblock.num_inodes / 1024).unwrap();
+        let mut inode_bitmap = vec![Bitmap::<1024>::new(); inode_bitmap_len];
+        for (i, bit) in self.inode_bitmap.iter().enumerate() {
+            if *bit {
+                let chunk_index = i / 1024;
+                let bit_index = i % 1024;
+                // Set bit in the actual bitmap
+                inode_bitmap[chunk_index].set(bit_index, true);
+            }
+        };
+        let data_bitmap_len = usize::try_from(self.superblock.num_blocks / 1024).unwrap();
+        let mut data_bitmap = vec![Bitmap::<1024>::new(); data_bitmap_len];
+        for (i, bit) in self.data_bitmap.iter().enumerate() {
+            if *bit {
+                let chunk_index = i / 1024;
+                let bit_index = i % 1024;
+                // Set bit in the actual bitmap
+                data_bitmap[chunk_index].set(bit_index, true);
+            }
+        };
+        Meta {
+            superblock: self.superblock.clone(),
+            inode_bitmap,
+            data_bitmap,
+            inode_table: self.inode_table.clone(),
+        }
+    }
+}
+
 struct Meta {
     superblock: Superblock,
     inode_bitmap: Vec<Bitmap<1024>>,
     data_bitmap: Vec<Bitmap<1024>>,
     inode_table: InodeTable,
+}
+
+impl Meta {
+    fn to_meta_serializable(&self) -> MetaSerializable {
+        let mut inode_bmap_bool: Vec<bool> = Vec::new();
+        for chunk in &self.inode_bitmap {
+            for i in 0..1024 {
+                if chunk.get(usize::try_from(i).unwrap()) {
+                    inode_bmap_bool.push(true)
+                } else {
+                    inode_bmap_bool.push(false)
+                }
+            }
+        };
+        let mut data_bmap_bool: Vec<bool> = Vec::new();
+        for chunk in &self.data_bitmap {
+            for i in 0..1024 {
+                if chunk.get(usize::try_from(i).unwrap()) {
+                    data_bmap_bool.push(true)
+                } else {
+                    data_bmap_bool.push(false)
+                }
+            }
+        };
+        MetaSerializable {
+            superblock: self.superblock.clone(),
+            inode_bitmap: inode_bmap_bool,
+            data_bitmap: data_bmap_bool,
+            inode_table: self.inode_table.clone(),
+        }
+    }
 }
 
 struct FuseFS {
@@ -204,10 +259,11 @@ impl FuseFS {
             let fd = File::open(&meta_file_path)?;
             let reader = BufReader::new(fd);
             // Update metadata with existing information from file.
-            match serde_json::from_reader(reader) {
+            let meta_ser: MetaSerializable = match serde_json::from_reader(reader) {
                 Ok(m) => m,
                 Err(e) => return Err(Error::new(ErrorKind::InvalidData, e)),
-            }
+            };
+            meta_ser.to_meta()
         } else {
             debug!("Creating new filesystem...");
             Meta {
@@ -240,6 +296,16 @@ impl FuseFS {
             meta_fd,
             store_fd,
         })
+    }
+
+    // NOTE: This just panics if something goes wrong. Should be fine, since
+    // we will probably only call this when shutting down the filesystem. Also,
+    // I'm lazy. Maybe you should handle errors nicely at some point.
+    fn flush_meta(&self) {
+        let meta_ser = self.meta.to_meta_serializable();
+        // Small hack to zero the file so we actually overwrite everything.
+        self.meta_fd.set_len(0).unwrap();
+        serde_json::to_writer(&self.meta_fd, &meta_ser).unwrap();
     }
 }
 
