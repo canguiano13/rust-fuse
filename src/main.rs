@@ -9,6 +9,10 @@ use std::path::Path;
 use bitmaps::Bitmap;
 use std::os::unix::fs::FileExt;
 use clap::Parser;
+use std::ffi::OsStr;
+use std::collections::HashMap;
+use std::sync::RwLock;
+
 
 use log::LevelFilter;
 use log::debug;
@@ -111,6 +115,7 @@ struct FuseFS {
     data_bitmap: Vec<Bitmap<1024>>,
     inode_table: InodeTable,
     block_store_fd: File,
+    dir_entries: RwLock<HashMap<u64, Vec<(u64, String)>>>,
 }
 
 // Implement methods specific to FuseFS design and structure.
@@ -130,6 +135,7 @@ impl FuseFS {
             data_bitmap,
             inode_table,
             block_store_fd: fd,
+            dir_entries: RwLock::new(HashMap::new()),
         }
     }
 
@@ -329,23 +335,27 @@ impl Filesystem for FuseFS {
         reply.attr(&std::time::Duration::from_secs(1), &attrs);
     }
 
+    //Adding readdir
     fn readdir(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64, mut reply: fuser::ReplyDirectory) {
-        // Only handle the root directory for now
         if ino.0 != 1 {
             reply.error(Errno::ENOENT);
             return;
         }
 
-        // Every directory needs these two entries
-        let entries = vec![
-            (INodeNo(1), fuser::FileType::Directory, "."),
-            (INodeNo(1), fuser::FileType::Directory, ".."),
+        let mut entries = vec![
+            (INodeNo(1), fuser::FileType::Directory, ".".to_string()),
+            (INodeNo(1), fuser::FileType::Directory, "..".to_string()),
         ];
 
-        // offset tells us where to resume listing from
+        // Add any files that have been created
+        if let Some(children) = self.dir_entries.read().unwrap().get(&ino.0) {
+            for (child_ino, name) in children {
+                entries.push((INodeNo(*child_ino), fuser::FileType::RegularFile, name.clone()));
+            }
+        }
+
         for (i, (inode, kind, name)) in entries.iter().enumerate().skip(offset as usize) {
             if reply.add(*inode, (i + 1) as u64, *kind, name) {
-                // Buffer is full, stop adding entries
                 break;
             }
         }
@@ -353,7 +363,76 @@ impl Filesystem for FuseFS {
         reply.ok();
     }
 
-    // Adding read and write
+    // Adding lookup, need lookup before implementing create
+    fn lookup(&self, _req: &Request, parent: INodeNo, _name: &OsStr, reply: fuser::ReplyEntry) {
+        // For now only handle lookups in the root directory
+        if parent.0 != 1 {
+            reply.error(Errno::ENOENT);
+            return;
+        }
+
+        // Search the inode table for a matching name, still need work
+        for inode in &self.inode_table {
+            if inode.hardlinks > 0 {
+                
+            }
+        }
+
+        // No file found
+        reply.error(Errno::ENOENT);
+    }
+
+    //Adding create
+    fn create(&self, _req: &Request, parent: INodeNo, name: &OsStr,
+          _mode: u32, _umask: u32, _flags: i32, reply: fuser::ReplyCreate) {
+
+        // Only support creating files in root directory for now
+        if parent.0 != 1 {
+            reply.error(Errno::ENOENT);
+            return;
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+
+        // Hardcode inode 2 for now just to verify create is working
+        let attrs = fuser::FileAttr {
+            ino: INodeNo(2),
+            size: 0,
+            blocks: 0,
+            atime: std::time::UNIX_EPOCH + std::time::Duration::new(now.as_secs(), now.subsec_nanos()),
+            mtime: std::time::UNIX_EPOCH + std::time::Duration::new(now.as_secs(), now.subsec_nanos()),
+            ctime: std::time::UNIX_EPOCH + std::time::Duration::new(now.as_secs(), now.subsec_nanos()),
+            crtime: std::time::UNIX_EPOCH,
+            kind: fuser::FileType::RegularFile,
+            perm: 0o644,
+            nlink: 1,
+            uid: _req.uid(),
+            gid: _req.gid(),
+            rdev: 0,
+            blksize: self.superblock.block_size,
+            flags: 0,
+        };
+
+        self.dir_entries
+            .write()
+            .unwrap()
+            .entry(parent.0)
+            .or_insert_with(Vec::new)
+            .push((2, name.to_string_lossy().to_string()));
+
+        info!("Created file {:?}", name);
+        reply.created(
+            &std::time::Duration::from_secs(1),
+            &attrs,
+            fuser::Generation(0),
+            fuser::FileHandle(0),
+            fuser::FopenFlags::empty(),
+        );
+    }
+    
+    // Adding read and write, still needs much work
     fn read(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64,
             size: u32, _flags: OpenFlags, _lock: Option<LockOwner>, reply: ReplyData) {
         // check if inode really exist
@@ -695,5 +774,68 @@ mod tests {
         assert_eq!(next_free_block, None);
     }
 
+    #[test]
+    fn test_allocate_inode_sets_bitmap() {
+        let tmp = NamedTempFile::new().unwrap();
+        let fd = tmp.reopen().unwrap();
+        let mut fs = FuseFS::new(fd, 4096, 1024, 1024);
 
+        // Allocate an inode and check the bit is set
+        let inode_num = fs.allocate_inode().expect("should have free inodes");
+        let chunk = (inode_num / 1024) as usize;
+        let bit = (inode_num % 1024) as usize;
+        assert!(fs.inode_bitmap[chunk].get(bit), "bitmap bit should be set after allocation");
+    }
+
+    #[test]
+    fn test_allocate_inode_returns_different_inodes() {
+        let tmp = NamedTempFile::new().unwrap();
+        let fd = tmp.reopen().unwrap();
+        let mut fs = FuseFS::new(fd, 4096, 1024, 1024);
+
+        // Two allocations should return different inodes
+        let inode1 = fs.allocate_inode().expect("should have free inodes");
+        let inode2 = fs.allocate_inode().expect("should still have free inodes");
+        assert_ne!(inode1, inode2, "should not allocate the same inode twice");
+    }
+
+    #[test]
+    fn test_allocate_block_sets_bitmap() {
+        let tmp = NamedTempFile::new().unwrap();
+        let fd = tmp.reopen().unwrap();
+        let mut fs = FuseFS::new(fd, 4096, 1024, 1024);
+
+        // Allocate a block and check the bit is set
+        let block_num = fs.allocate_block().expect("should have free blocks");
+        let chunk = (block_num / 1024) as usize;
+        let bit = (block_num % 1024) as usize;
+        assert!(fs.data_bitmap[chunk].get(bit), "bitmap bit should be set after allocation");
+    }
+
+    #[test]
+    fn test_allocate_block_returns_different_blocks() {
+        let tmp = NamedTempFile::new().unwrap();
+        let fd = tmp.reopen().unwrap();
+        let mut fs = FuseFS::new(fd, 4096, 1024, 1024);
+
+        // Two allocations should return different blocks
+        let block1 = fs.allocate_block().expect("should have free blocks");
+        let block2 = fs.allocate_block().expect("should still have free blocks");
+        assert_ne!(block1, block2, "should not allocate the same block twice");
+    }
+
+    #[test]
+    fn test_allocate_inode_returns_none_when_full() {
+        let tmp = NamedTempFile::new().unwrap();
+        let fd = tmp.reopen().unwrap();
+        let mut fs = FuseFS::new(fd, 4096, 1024, 1024);
+
+        // Fill up all inodes
+        for _ in 0..1024 {
+            fs.allocate_inode().expect("should have free inodes");
+        }
+
+        // Next allocation should return None
+        assert!(fs.allocate_inode().is_none(), "should return None when all inodes are used");
+    }
 }
