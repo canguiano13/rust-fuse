@@ -155,17 +155,19 @@ impl FuseFS {
     // if space is available, return the offset of the free block from the start of data region
     // return None if there is no space in the data region
     fn next_free_inode(&self) -> Option<u64> { 
+        let bit_per_chunk = 1024;
+
         // search one bitmap chunk at a time
         for (chunk_idx, chunk) in self.inode_bitmap.iter().enumerate(){
             // check each bit until we find a free space
             let mut i = 0;
-            while chunk.get(i){
+            while i < bit_per_chunk && chunk.get(i){
                 i += 1
             }
 
             // check that it's actually free and not that the entire chunk is allocated
-            if i < 1024 && !chunk.get(i){
-                return Some(((chunk_idx * 1024) + i) as u64);
+            if i < bit_per_chunk{
+                return Some(((chunk_idx * bit_per_chunk) + i) as u64);
             }
         }
 
@@ -177,17 +179,19 @@ impl FuseFS {
     // if space is available, return the offset of the free block from the start of data region
     // return None if there is no space in the data region
     fn next_free_block(&self) -> Option<u64> { 
+        let bit_per_chunk = 1024;
+
         // search one bitmap chunk at a time
         for (chunk_idx, chunk) in self.data_bitmap.iter().enumerate(){
             // check each bit until we find a free space
             let mut i = 0;
-            while chunk.get(i){
+            while i < bit_per_chunk && chunk.get(i){
                 i += 1
             }
 
             // check that it's actually free and not that the entire chunk is allocated
-            if i < 1024 && !chunk.get(i){
-                return Some(((chunk_idx * 1024) + i) as u64);
+            if i < bit_per_chunk{
+                return Some(((chunk_idx * bit_per_chunk) + i) as u64);
             }
         }
 
@@ -636,4 +640,60 @@ mod tests {
         // Verify permissions
         assert_eq!(fs.inode_table[root_inode].mode, 0o755);
     }   
+
+
+    #[test]
+    fn test_next_free_inode_empty_fs() {
+        let tmp = NamedTempFile::new().unwrap();
+        let fd = tmp.reopen().unwrap();
+        let mut fs = FuseFS::new(fd, 4096, 1024, 1024);
+
+        //verify that the first space in inode table is free for a new fs
+        let first_free_inode = fs.next_free_inode();
+        assert_eq!(first_free_inode, Some(0));
+        
+    }
+    #[test]
+    fn test_next_free_inode_full_fs() {
+        let tmp = NamedTempFile::new().unwrap();
+        let fd = tmp.reopen().unwrap();
+        let mut fs = FuseFS::new(fd, 4096, 1024, 1024);
+
+        //fill the bitmap using allocate_indode()
+        //TODO verify that this logic is correct
+        for i in 0..fs.superblock.num_inodes{
+            fs.allocate_inode();
+        }
+
+        let next_free_inode = fs.next_free_inode();
+        assert_eq!(next_free_inode, None);
+    }
+
+
+    #[test]
+    fn test_next_free_block_empty_fs() {
+        let tmp = NamedTempFile::new().unwrap();
+        let fd = tmp.reopen().unwrap();
+        let mut fs = FuseFS::new(fd, 4096, 1024, 1024);
+
+        let first_free_block = fs.next_free_block();
+        assert_eq!(first_free_block, Some(0));
+    }
+    #[test]
+    fn test_next_free_block_full_fs() {
+        let tmp = NamedTempFile::new().unwrap();
+        let fd = tmp.reopen().unwrap();
+        let mut fs = FuseFS::new(fd, 4096, 1024, 1024);
+
+        //fill the bitmap using allocate_block()
+        //TODO verify that this logic is correct
+        for i in 0..fs.superblock.num_blocks{
+            fs.allocate_block();
+        }
+
+        let next_free_block = fs.next_free_block();
+        assert_eq!(next_free_block, None);
+    }
+
+
 }
