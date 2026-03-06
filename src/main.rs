@@ -245,7 +245,7 @@ struct FuseFS {
 // Implement methods specific to FuseFS design and structure.
 impl FuseFS {
     fn new(fs_dir_path: PathBuf, block_size: u32, num_inodes: u64, num_blocks: u64) -> Result<FuseFS, Error> {
-        debug!("Creating filesystem..");
+        info!("Creating filesystem..");
         // Construct paths to expected files
         let mut meta_file_path: PathBuf = fs_dir_path.clone();
         meta_file_path.push(Path::new(META_FILE_NAME));
@@ -255,7 +255,7 @@ impl FuseFS {
         // If the filesystem backing files already exist, load in existing
         // metadata. Otherwise, initialize new defaults.
         let meta = if meta_file_path.exists() && store_file_path.exists() {
-            debug!("Loading existing filesystem...");
+            info!("Loading existing filesystem...");
             let fd = File::open(&meta_file_path)?;
             let reader = BufReader::new(fd);
             // Update metadata with existing information from file.
@@ -265,7 +265,7 @@ impl FuseFS {
             };
             meta_ser.to_meta()
         } else {
-            debug!("Creating new filesystem...");
+            info!("Creating new filesystem...");
             Meta {
                 superblock: Superblock::new(block_size, num_inodes, num_blocks),
                 // TODO: Check if this syntax actually does what you want it to do.
@@ -280,16 +280,14 @@ impl FuseFS {
             .create(true)
             .write(true)
             .read(true)
-            .truncate(true)
             .open(meta_file_path)?;
         let store_fd = OpenOptions::new()
             .create(true)
             .write(true)
             .read(true)
-            .truncate(true)
             .open(store_file_path)?;
 
-        debug!("Created filesystem.");
+        info!("Created filesystem.");
         Ok(FuseFS {
             fs_dir: fs_dir_path,
             meta,
@@ -334,6 +332,38 @@ impl Filesystem for FuseFS {
     //         Err(_) => reply.error(libc::EIO),
     //     }
     // }
+
+    fn init(&mut self, _req: &Request, _config: &mut fuser::KernelConfig) -> Result<(), io::Error> {
+        info!("Filesystem mounted successfully");
+        // Set up root directory as inode 1
+        let root_inode: usize = 0;
+        let chunk = root_inode / 1024;
+        let bit = root_inode % 1024;
+        self.meta.inode_bitmap[chunk].set(bit, true);
+        self.meta.inode_table[root_inode] = InodeAttributes {
+            inode: root_inode as u64,
+            size: 0,
+            kind: FileKind::Directory,
+            mode: 0o755,
+            hardlinks: 2,
+            uid: 0,
+            gid: 0,
+            // TODO: Do we really need this?
+            ..Default::default()
+        };
+        Ok(())
+    }
+
+    fn destroy(&mut self) {
+        // Flush metadata to disk
+        self.flush_meta();
+        // fsync both metadata and block data
+        // NOTE: We just ignore if there's an error here for now; I guess we
+        // could make an error here more explicit, but there's also not much
+        // to do even if there is an error.
+        let _ = self.meta_fd.sync_all();
+        let _ = self.store_fd.sync_all();
+    }
 }
 
 #[derive(Parser)]
