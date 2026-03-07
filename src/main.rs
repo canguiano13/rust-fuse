@@ -63,6 +63,8 @@ impl Superblock {
 // The first value is the start location; the second value is the extent length.
 type Extent = (u64, u64);
 
+type DirectoryEntries
+
 // TODO: Why does simple.rs use FileKind and not just fuser::FileType? Should
 // we continue to do this?
 #[derive(Serialize, Deserialize, Copy, Clone, PartialEq, Default)]
@@ -253,52 +255,110 @@ impl FuseFS {
         serde_json::to_writer(&self.meta_fd, &meta_ser).unwrap();
     }
 
-    // TODO search for next free space in the inode table using bitmap
-    // if space is available, return the offset of the free block from the start of data region
-    // return None if there is no space in the data region
+    // If an inode is available, set the inode bit and return the offset of the
+    // free block from the start of data region. Otherwise, do nothing and return
+    // None. We currently just use a simple linear search.
+    // NOTE (side-effect): This function may change inode bitmap state.
     fn next_free_inode(&self) -> Option<u64> {
         let bit_per_chunk = 1024;
-
-        // search one bitmap chunk at a time
-        for (chunk_idx, chunk) in self.inode_bitmap.iter().enumerate(){
+        for (chunk_idx, chunk) in self.meta.inode_bitmap.iter().enumerate() {
             // check each bit until we find a free space
-            let mut i = 0;
-            while i < bit_per_chunk && chunk.get(i){
-                i += 1
+            match chunk.first_false_index() {
+                Some(i) => {
+                    // Get mutable chunk here
+                    let mut mutable_chunk = self.meta.inode_bitmap[chunk_idx];
+                    mutable_chunk.set(i, true);
+                    return Some(((chunk_idx * bit_per_chunk) + i) as u64);
+                },
+                None => continue,
             }
-
-            // check that it's actually free and not that the entire chunk is allocated
-            if i < bit_per_chunk{
-                return Some(((chunk_idx * bit_per_chunk) + i) as u64);
-            }
-        }
-
-        //no free spots
-        return None;
+        };
+        return None
     }
 
-    // TODO search for next free space in the data region using bitmap
-    // if space is available, return the offset of the free block from the start of data region
-    // return None if there is no space in the data region
-    fn next_free_block(&self) -> Option<u64> {
+    // If space is available of the desired size, return the extent(s)
+    // corresponding to the free block(s). Otherwise, return None.
+    fn next_free_block_extent(&self, size: usize) -> Option<Vec<Extent>> {
         let bit_per_chunk = 1024;
-
-        // search one bitmap chunk at a time
-        for (chunk_idx, chunk) in self.data_bitmap.iter().enumerate(){
+        let mut num_blocks_needed = size / (self.meta.superblock.block_size as usize) + 1;
+        let mut extents: Vec<Extent> = Vec::new();
+        // Find list of extents with total desired size
+        for (chunk_idx, chunk) in self.meta.inode_bitmap.iter().enumerate() {
+            let base_offset = chunk_idx * bit_per_chunk;
+            // Get mutable chunk here
+            let mut mutable_chunk = self.meta.inode_bitmap[chunk_idx];
+            let mut ex_open: usize;
+            let mut ex_close: usize;
             // check each bit until we find a free space
-            let mut i = 0;
-            while i < bit_per_chunk && chunk.get(i){
-                i += 1
+            // Assertion here should be that num_blocks_needed > 0
+            ex_open = match chunk.first_false_index() {
+                Some(i) => {
+                    // Decrement number of blocks needed
+                    num_blocks_needed -= 1;
+                    mutable_chunk.set(i, true);
+                    i
+                },
+                None => continue,
+            };
+            loop {
+                let next_filled_i = match chunk.next_index(ex_open) {
+                    Some(i) => i,
+                    // A bit weird, but we want to re-use the logic below. If
+                    // there is no next 'true' bit, then we are free until the
+                    // very end of the chunk, and we want to loop all the way
+                    // up until the very last bit in the chunk.
+                    None => bit_per_chunk + 1,
+                };
+                let free_size = next_filled_i - ex_open;
+                if free_size > num_blocks_needed {
+                    // Allocate remaining blocks we need
+                    for i in ex_open..(ex_open + num_blocks_needed + 1) {
+                        mutable_chunk.set(i, true);
+                    };
+                    ex_close = ex_open + num_blocks_needed;
+                    // Do annoying type conversion to u64.
+                    let global_ex_open: u64 = match (base_offset + ex_open).try_into() {
+                        Ok(o) => o,
+                        Err(e) => panic!("{}", e),
+                    };
+                    let global_ex_close: u64 = match (base_offset + ex_close).try_into() {
+                        Ok(o) => o,
+                        Err(e) => panic!("{}", e),
+                    };
+                    extents.push((global_ex_open, global_ex_close));
+                    return Some(extents)
+                } else {
+                    // Allocate all blocks in the free chunk and continue
+                    for i in ex_open..next_filled_i {
+                        mutable_chunk.set(i, true);
+                    };
+                    ex_close = next_filled_i - 1;
+                    // Decrease number of free blocks still needed accordingly.
+                    num_blocks_needed -= free_size;
+                    // Do annoying type conversion to u64.
+                    let global_ex_open: u64 = match (base_offset + ex_open).try_into() {
+                        Ok(o) => o,
+                        Err(e) => panic!("{}", e),
+                    };
+                    let global_ex_close: u64 = match (base_offset + ex_close).try_into() {
+                        Ok(o) => o,
+                        Err(e) => panic!("{}", e),
+                    };
+                    extents.push((global_ex_open, global_ex_close));
+                }
+                ex_open = match chunk.next_false_index(ex_close) {
+                    // If we still have free blocks left in the current chunk,
+                    // set the new initial extent offset to the next free block
+                    // and continue the loop in the current chunk.
+                    Some(i) => i,
+                    // If we're out of free blocks in the current chunk, break
+                    // out of this loop and go to the next chunk (in the outer
+                    // for-loop).
+                    None => break,
+                };
             }
-
-            // check that it's actually free and not that the entire chunk is allocated
-            if i < bit_per_chunk{
-                return Some(((chunk_idx * bit_per_chunk) + i) as u64);
-            }
-        }
-
-        //no free spots
-        return None;
+        };
+        return None
     }
 
     // TODO allocate an inode basd on available space in the inode table
