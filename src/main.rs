@@ -1,6 +1,8 @@
 use std::fs::File;
 use std::io;
 use std::io::Error;
+use std::collections::BTreeMap;
+use std::ffi::OsStr;
 // use std::io::prelude::*;
 use std::io::ErrorKind;
 use std::io::BufReader;
@@ -9,6 +11,9 @@ use std::path::PathBuf;
 use std::path::Path;
 use std::os::unix::fs::FileExt;
 use std::fs::OpenOptions;
+use std::time::Duration;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use log::LevelFilter;
 use log::debug;
@@ -34,6 +39,7 @@ use fuser::OpenFlags;
 use fuser::LockOwner;
 use fuser::ReplyData;
 use fuser::Config;
+use fuser::Errno;
 
 const FSID: u32 = 0x55555;
 const META_FILE_NAME: &str = "meta.fs";
@@ -63,10 +69,7 @@ impl Superblock {
 // The first value is the start location; the second value is the extent length.
 type Extent = (u64, u64);
 
-type DirectoryEntries
-
-// TODO: Why does simple.rs use FileKind and not just fuser::FileType? Should
-// we continue to do this?
+// NOTE: Only support three basic kinds of files.
 #[derive(Serialize, Deserialize, Copy, Clone, PartialEq, Default)]
 enum FileKind {
     #[default]
@@ -74,6 +77,42 @@ enum FileKind {
     Directory,
     Symlink,
 }
+
+impl From<FileKind> for fuser::FileType {
+    fn from(kind: FileKind) -> Self {
+        match kind {
+            FileKind::File => fuser::FileType::RegularFile,
+            FileKind::Directory => fuser::FileType::Directory,
+            FileKind::Symlink => fuser::FileType::Symlink,
+        }
+    }
+}
+
+// Some helper functions for time.
+// =============================================================================
+fn time_now() -> (i64, u32) {
+    time_from_system_time(&SystemTime::now())
+}
+
+fn system_time_from_time(secs: i64, nsecs: u32) -> SystemTime {
+    if secs >= 0 {
+        UNIX_EPOCH + Duration::new(secs as u64, nsecs)
+    } else {
+        UNIX_EPOCH - Duration::new((-secs) as u64, nsecs)
+    }
+}
+
+fn time_from_system_time(system_time: &SystemTime) -> (i64, u32) {
+    // Convert to signed 64-bit time with epoch at 0
+    match system_time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => (duration.as_secs() as i64, duration.subsec_nanos()),
+        Err(before_epoch_error) => (
+            -(before_epoch_error.duration().as_secs() as i64),
+            before_epoch_error.duration().subsec_nanos(),
+        ),
+    }
+}
+// =============================================================================
 
 #[derive(Serialize, Deserialize, Default, Clone)]
 struct InodeAttributes {
@@ -181,6 +220,9 @@ impl Meta {
     }
 }
 
+// A B-tree map relating file name to a tuple of (inode number, file kind).
+type DirectoryEntries = BTreeMap<Vec<u8>, (u64, FileKind)>;
+
 struct FuseFS {
     fs_dir: PathBuf,
     meta: Meta,
@@ -276,17 +318,17 @@ impl FuseFS {
         return None
     }
 
-    // If space is available of the desired size, return the extent(s)
-    // corresponding to the free block(s). Otherwise, return None.
+    // If space is available of the desired size, allocate that space by setting
+    // all corresponding data bitmap bits and return the associatd extent(s).
+    // Otherwise, return None.
+    // NOTE (side-effect): This function may change data bitmap state.
     fn next_free_block_extent(&self, size: usize) -> Option<Vec<Extent>> {
         let bit_per_chunk = 1024;
         let mut num_blocks_needed = size / (self.meta.superblock.block_size as usize) + 1;
         let mut extents: Vec<Extent> = Vec::new();
         // Find list of extents with total desired size
-        for (chunk_idx, chunk) in self.meta.inode_bitmap.iter().enumerate() {
+        for (chunk_idx, chunk) in self.meta.data_bitmap.iter().enumerate() {
             let base_offset = chunk_idx * bit_per_chunk;
-            // Get mutable chunk here
-            let mut mutable_chunk = self.meta.inode_bitmap[chunk_idx];
             let mut ex_open: usize;
             let mut ex_close: usize;
             // check each bit until we find a free space
@@ -295,7 +337,6 @@ impl FuseFS {
                 Some(i) => {
                     // Decrement number of blocks needed
                     num_blocks_needed -= 1;
-                    mutable_chunk.set(i, true);
                     i
                 },
                 None => continue,
@@ -311,10 +352,8 @@ impl FuseFS {
                 };
                 let free_size = next_filled_i - ex_open;
                 if free_size > num_blocks_needed {
-                    // Allocate remaining blocks we need
-                    for i in ex_open..(ex_open + num_blocks_needed + 1) {
-                        mutable_chunk.set(i, true);
-                    };
+                    // NOTE: At this point, we know that we have found enough
+                    // space for the full allocation.
                     ex_close = ex_open + num_blocks_needed;
                     // Do annoying type conversion to u64.
                     let global_ex_open: u64 = match (base_offset + ex_open).try_into() {
@@ -326,12 +365,24 @@ impl FuseFS {
                         Err(e) => panic!("{}", e),
                     };
                     extents.push((global_ex_open, global_ex_close));
+                    // Only actually allocate/set inode bits when we definitely
+                    // have enough space for the full allocation.
+                    for ex in &extents {
+                        let open = ex.0;
+                        let close = ex.1;
+                        // NOTE: Both open and close should be in the same
+                        // chunk, i.e. open / 1024 == close / 1024. Again, this
+                        // is an assertion that I unfortunately can't prove in
+                        // the code.
+                        let mut mutable_chunk = self.meta.data_bitmap[(open / 1024) as usize];
+                        let bit_offset_open = open % 1024;
+                        let bit_offset_close = close % 1024;
+                        for i in bit_offset_open..(bit_offset_close + 1) {
+                            mutable_chunk.set(i as usize, true);
+                        }
+                    }
                     return Some(extents)
                 } else {
-                    // Allocate all blocks in the free chunk and continue
-                    for i in ex_open..next_filled_i {
-                        mutable_chunk.set(i, true);
-                    };
                     ex_close = next_filled_i - 1;
                     // Decrease number of free blocks still needed accordingly.
                     num_blocks_needed -= free_size;
@@ -359,53 +410,6 @@ impl FuseFS {
             }
         };
         return None
-    }
-
-    // TODO allocate an inode basd on available space in the inode table
-    fn allocate_inode(&mut self) -> Option<u64>{
-        // get the index of the next free inode
-        let free_idx = self.next_free_inode();
-
-        //
-        if let Some(idx) = free_idx{
-            // allocate it
-            //TODO need to make some logic to create an inode
-
-            // mark it as allocated
-            let chunk = (idx / 1024) as usize; // compiler doesn't like it without casting for some reason??
-            let bit = (idx % 1024) as usize;
-            self.inode_bitmap[chunk].set(bit, true);
-
-            // return the location that the data was allocated at
-            return Some(idx);
-
-        } else{
-            // no free space available in inode table
-            return None
-        }
-    }
-
-    // TODO allocate data block based on available space in the data region
-    fn allocate_block(&mut self) -> Option<u64>{
-        // get the index of the next free data block
-        let free_idx = self.next_free_block();
-
-        if let Some(idx) = free_idx{
-            // allocate block it
-            //TODO need to make some logic to write to data region
-
-            // mark it as allocated
-            let chunk = (idx / 1024) as usize; // compiler doesn't like it without casting for some reason??
-            let bit = (idx % 1024) as usize;
-            self.data_bitmap[chunk].set(bit, true);
-
-            // return the location that the data was allocated at
-            return Some(idx);
-
-        } else{
-            // no free space available in data region
-            return None
-        }
     }
 }
 
@@ -443,14 +447,11 @@ impl Filesystem for FuseFS {
         let _ = self.store_fd.sync_all();
     }
 
-
-    // Add getattr
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: fuser::ReplyAttr) {
         let chunk = ino.0 as usize / 1024;
         let bit = ino.0 as usize % 1024;
-
-        // Check if inode is allocated in the bitmap
-        match self.inode_bitmap.get(chunk) {
+        // Check if inode is actually allocated in the bitmap
+        match self.meta.inode_bitmap.get(chunk) {
             None => {
                 reply.error(Errno::ENOENT);
                 return;
@@ -462,42 +463,30 @@ impl Filesystem for FuseFS {
                 }
             }
         }
-
-        // Look up the inode in the table
-        let inode = &self.inode_table[ino.0 as usize];
-
-        let kind = match inode.kind {
-            FileKind::File => fuser::FileType::RegularFile,
-            FileKind::Directory => fuser::FileType::Directory,
-            FileKind::Symlink => fuser::FileType::Symlink,
-        };
-
+        // Look up the inode attributes in the inode table
+        let inode = &self.meta.inode_table[ino.0 as usize];
+        // Convert InodeAttributes to fuser::FileAttr
         let attrs = fuser::FileAttr {
-            ino: ino,
+            ino,
             size: inode.size,
-            blocks: (inode.size + self.superblock.block_size as u64 - 1)
-                / self.superblock.block_size as u64,
-            atime: std::time::UNIX_EPOCH
-                + std::time::Duration::new(inode.last_accessed.0 as u64, inode.last_accessed.1),
-            mtime: std::time::UNIX_EPOCH
-                + std::time::Duration::new(inode.last_modified.0 as u64, inode.last_modified.1),
-            ctime: std::time::UNIX_EPOCH
-                + std::time::Duration::new(inode.last_metadata_changed.0 as u64, inode.last_metadata_changed.1),
+            blocks: inode.size.div_ceil(u64::from(self.meta.superblock.block_size as u64)),
+            atime: system_time_from_time(inode.last_accessed.0, inode.last_accessed.1),
+            mtime: system_time_from_time(inode.last_modified.0, inode.last_modified.1),
+            ctime: system_time_from_time(inode.last_metadata_changed.0, inode.last_metadata_changed.1),
             crtime: std::time::UNIX_EPOCH,
-            kind,
+            kind: inode.kind.into(),
             perm: inode.mode,
             nlink: inode.hardlinks,
             uid: inode.uid,
             gid: inode.gid,
             rdev: 0,
-            blksize: self.superblock.block_size,
+            blksize: self.meta.superblock.block_size,
             flags: 0,
         };
-
+        // Return attributes in the appropriate way
         reply.attr(&std::time::Duration::from_secs(1), &attrs);
     }
 
-    //Adding readdir
     fn readdir(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64, mut reply: fuser::ReplyDirectory) {
         if ino.0 != 1 {
             reply.error(Errno::ENOENT);
@@ -598,7 +587,7 @@ impl Filesystem for FuseFS {
     fn read(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64,
             size: u32, _flags: OpenFlags, _lock: Option<LockOwner>, reply: ReplyData) {
         // check if inode really exist
-        if self.inode_bitmap.get(ino.0 as usize).is_none() {
+        if self.meta.inode_bitmap.get(ino.0 as usize).is_none() {
             // If the bit is 0, file doesn't exist
             reply.error(Errno::ENOENT);
             return;

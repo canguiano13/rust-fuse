@@ -1,3 +1,8 @@
-- Implement/define an API for all important functions for Carlos and Simon to program against.
-- Implement the serialization stuff using serde_json: two separate files, write to store immediately, only write metadata from memory to the metadata file when filesystem is unmounted/closed (and also on initial startup) to keep things simple.
-- Implement own bitmap representation, or figure out how to serialize Bitmap from the external library.
+- Add directory entries data structure the system
+- Fix all existing, broken Filesystem implementations.
+- Add the Filesystem functions I assigned myself.
+- Draft presentation bones.
+
+extra shit:
+- Actually serialize metadata to vec of u8s and use rkyv (or another more efficient serialization format).
+- Break up and test next_free_block_extent function.
