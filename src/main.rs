@@ -34,6 +34,8 @@ use fuser::LockOwner;
 use fuser::ReplyData;
 use fuser::Config;
 use fuser::Errno;
+use fuser::ReplyEmpty;
+use fuser::ReplyEntry;
 
 const FSID: u32 = 0x55555;
 
@@ -156,7 +158,6 @@ impl FuseFS {
         FuseFS::new(fd, 4096, 32768, 32768)
     }
 
-
     // TODO search for next free space in the inode table using bitmap
     // if space is available, return the offset of the free block from the start of data region
     // return None if there is no space in the data region
@@ -181,7 +182,7 @@ impl FuseFS {
         return None;
     }
 
-    // TODO search for next free space in the data region using bitmap
+    // search for next free space in the data region using bitmap
     // if space is available, return the offset of the free block from the start of data region
     // return None if there is no space in the data region
     fn next_free_block(&self) -> Option<u64> { 
@@ -205,16 +206,12 @@ impl FuseFS {
         return None;
     }
 
-    // TODO allocate an inode basd on available space in the inode table
+    // allocate an inode basd on available space in the inode table
     fn allocate_inode(&mut self) -> Option<u64>{
         // get the index of the next free inode
         let free_idx = self.next_free_inode();
 
-        //
         if let Some(idx) = free_idx{
-            // allocate it
-            //TODO need to make some logic to create an inode
-    
             // mark it as allocated
             let chunk = (idx / 1024) as usize; // compiler doesn't like it without casting for some reason??
             let bit = (idx % 1024) as usize;
@@ -228,7 +225,6 @@ impl FuseFS {
             return None
         }
     }
-
 
     // TODO allocate data block based on available space in the data region
     fn allocate_block(&mut self) -> Option<u64>{
@@ -251,6 +247,16 @@ impl FuseFS {
             // no free space available in data region
             return None
         }
+    }
+
+    //number of blocks allocated for file 
+    fn blocks_allocated(&self, inode_size: u64) -> u64{
+        (inode_size + self.superblock.block_size as u64 - 1) / self.superblock.block_size as u64
+    }
+
+    //calculate offset into data region for given block
+    fn offset_from_block_offset(&self, block_idx: u64){
+        self.superblock.data_start + (block_idx * self.superblock.block_size as u64);
     }
 
 
@@ -454,6 +460,222 @@ impl Filesystem for FuseFS {
             Ok(bytes_read) => reply.data(&buffer[..bytes_read]),
             Err(_) => reply.error(Errno::EIO),
         }
+    }
+
+    //carlos todo
+    //create a symbolic link
+    //TODO i need a mutable reference to self here, but that goes against the trait requirement. what do?
+    fn symlink(&self, _req: &Request, parent: INodeNo, link_name: &OsStr, target: &Path, reply: ReplyEntry){
+        // check if there is space in the inode table, if there is reserve the space
+        let free_inode_idx = self.allocate_inode();
+        //no space in inode table
+        if free_inode_idx.is_none(){
+            return reply.error(Errno::ENOSPC);
+        }
+        let inode_idx = free_inode_idx.unwrap();
+
+        // check if there is space in the data region and then try to allocate space for the symlink
+        let free_block_idx = self.allocate_block();
+        //no space in data region
+        if free_block_idx.is_none(){
+            return reply.error(Errno::ENOSPC);
+        }
+        let block_idx = free_block_idx.unwrap();
+
+        //store target link path as slice of bytes in data region 
+        let path_bytes = target.as_os_str().as_encoded_bytes();
+        let offset = sefl.offset_from_block_idx(block_idx);
+
+        //try to write the path into a data block
+        let res = self.block_store_fd.write_at(path_bytes, offset);
+        if res.is_err(){
+            return reply.error(Errno::EIO);
+        }
+
+        //create an inode for the symlink
+        let symlink_attrs = InodeAttributes{
+            inode: inode_idx,
+            open_file_handles: 0,
+            size: path_bytes.len() as u64,
+            kind: FileKind::Symlink,
+            hardlinks: 1,
+            mode: 0o644,
+            uid: _req.uid(),
+            gid: _req.gid(),
+            //TODO not sure if this is right?
+            extent_index: [(block_idx, 1), (0,0), (0,0), (0,0), (0,0), (0,0), (0,0), (0,0)],
+            ..Default::default()
+        };
+
+        //need to return a fuser fileattr
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+
+        let attrs = fuser::FileAttr {
+            ino: INodeNo(inode_idx),
+            size: symlink_attrs.size,
+            blocks: self.blocks_allocated(symlink_attrs.size),
+            atime: std::time::UNIX_EPOCH + std::time::Duration::new(now.as_secs(), now.subsec_nanos()),
+            mtime: std::time::UNIX_EPOCH + std::time::Duration::new(now.as_secs(), now.subsec_nanos()),
+            ctime: std::time::UNIX_EPOCH + std::time::Duration::new(now.as_secs(), now.subsec_nanos()),
+            crtime: std::time::UNIX_EPOCH,
+            kind: fuser::FileType::Symlink,
+            perm: 0o644,
+            nlink: 1,
+            uid: _req.uid(),
+            gid: _req.gid(),
+            rdev: 0,
+            blksize: self.superblock.block_size,
+            flags: 0
+        };
+
+        //store inode in inode table
+        self.inode_table[inode_idx as usize] = symlink_attrs;
+
+        //also add it to the directory
+        self.dir_entries
+            .write()
+            .unwrap()
+            .entry(parent.0)
+            .or_insert_with(Vec::new)
+            .push((inode_idx, link_name.to_string_lossy().to_string()));
+
+        reply.entry(&std::time::Duration::from_secs(1), &attrs, fuser::Generation(0));
+    }
+
+    //create a hard link
+    fn link(&self, _req: &Request, ino: INodeNo, newparent: INodeNo, newname: &OsStr, reply: ReplyEntry){
+        let chunk = ino.0 as usize / 1024;
+        let bit = ino.0 as usize % 1024;
+
+        //check that the inode we're trying to link to already exists
+        match self.inode_bitmap.get(chunk) {
+            None => {
+                reply.error(Errno::EINVAL);
+                return;
+            }
+            Some(bitmap) => {
+                if !bitmap.get(bit) {
+                    reply.error(Errno::EINVAL);
+                    return;
+                }
+            }
+        }
+
+        //get inode from inode table 
+        let mut inode = &mut self.inode_table[ino.0 as usize];
+
+        //increment the hardlinks counter in inode
+        inode.hardlinks = inode.hardlinks + 1;
+
+        //create a new entry in the directory as well
+        self.dir_entries
+            .write()
+            .unwrap()
+            .entry(newparent.0)
+            .or_insert_with(Vec::new)
+            .push((ino.0, newname.to_string_lossy().to_string()));
+
+        //return hardlink as fuser fileattr
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        
+        let filekind = match inode.kind {
+            FileKind::File => fuser::FileType::RegularFile,
+            FileKind::Directory => fuser::FileType::Directory,
+            FileKind::Symlink => fuser::FileType::Symlink,
+        };
+
+        let attrs = fuser::FileAttr{
+            ino: ino,
+            size: inode.size,
+            blocks: self.blocks_allocated(inode.size),
+            atime: std::time::UNIX_EPOCH + std::time::Duration::new(now.as_secs(), now.subsec_nanos()),
+            mtime: std::time::UNIX_EPOCH + std::time::Duration::new(now.as_secs(), now.subsec_nanos()),
+            ctime: std::time::UNIX_EPOCH + std::time::Duration::new(now.as_secs(), now.subsec_nanos()),
+            crtime: std::time::UNIX_EPOCH,
+            kind: filekind,
+            perm: inode.mode,
+            nlink: inode.hardlinks,
+            uid: _req.uid(),
+            gid: _req.gid(),
+            rdev: 0,
+            blksize: self.superblock.block_size,
+            flags: 0
+        };
+        reply.entry(&std::time::Duration::from_secs(1), &attrs, fuser::Generation(0));
+    }
+
+    //read symbolic link
+    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData){
+        //make sure the symlink inode exists
+        //check if the inode is allocated in the bitmap
+        let chunk = ino.0 as usize / 1024;
+        let bit = ino.0 as usize % 1024;
+        match self.inode_bitmap.get(chunk) {
+            None => {
+                reply.error(Errno::ENOENT);
+                return;
+            }
+            Some(bitmap) => {
+                if !bitmap.get(bit) {
+                    reply.error(Errno::ENOENT);
+                    return;
+                }
+            }
+        }
+
+        //also make sure its a symlink
+        let inode = &self.inode_table[ino.0 as usize];
+        if inode.kind != FileKind::Symlink{
+            return reply.error(Errno::EINVAL);
+        }
+
+        //get the block address from the extent
+        let block_idx = inode.extent_index[0].0;
+
+        //calculate offset into data region
+        let offset = self.offset_from_block_idx(block_idx);
+
+        //buffer to read in symlink
+        //symlink stored as array of bytes
+        let mut path_bytes = vec![0u8; inode.size as usize];
+
+        //try to read the information from the data region 
+        let res = self.block_store_fd.read_at(&mut path_bytes, offset);
+        if res.is_err(){
+            return reply.error(Errno::EIO);
+        }
+
+        //return symlink path as replydata
+        let bytes_read = res.unwrap();
+        reply.data(&path_bytes[..bytes_read]);
+    }
+
+    //TODO remove a file
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty){
+        //get the file using lookup
+
+        //mark the entry in the inode table storing this link as free
+        //decrement the number of links to the inode
+        //remove it from the directory it's in
+        //if there are no more links, release the data
+    }
+  
+    //TODO 
+    fn release(&self, _req: &Request, _ino: INodeNo, _fh: FileHandle, _flags: OpenFlags, _lock_owner: Option<LockOwner>, _flush: bool, reply: ReplyEmpty){
+        //nothing to release because we're using a file for our data region
+        //just need to make sure the data in the data region is marked as free
+        //this is done in unlink already
+        reply.ok()
+    }
+
+    //Create file node. Create a regular file, character device, block device, fifo or socket node.
+    fn mknod(&self, _req: &Request, parent: INodeNo, name: &OsStr,  mode: u32, umask: u32, rdev: u32, reply: ReplyEmpty){
+        //don't need to deal with special files for now
+        Errno::ENOSYS
     }
 }
 
