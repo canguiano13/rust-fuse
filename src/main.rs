@@ -277,18 +277,20 @@ impl FuseFS {
 
     //number of blocks allocated for file 
     fn blocks_allocated(&self, inode_size: u64) -> u64{
-        (inode_size + self.superblock.block_size as u64 - 1) / self.superblock.block_size as u64
+        return (inode_size + self.superblock.block_size as u64 - 1) / self.superblock.block_size as u64
     }
 
     //calculate offset into data region for given block
-    fn offset_from_block_offset(&self, block_idx: u64){
-        self.superblock.data_start + (block_idx * self.superblock.block_size as u64);
+    fn offset_from_block_idx(&self, block_idx: u64) -> u64{
+       return self.superblock.data_start + (block_idx * self.superblock.block_size as u64);
     }
 
     //find a entry in a directory
     fn find_dir_entry(&self, parent: u64, target_name: &OsStr) -> Option<u64>{
+
         //get files in directory based on directory inode number
-        let entries = self.dir_entries.read().unwrap().get(&parent);
+        let binding = self.dir_entries.read().unwrap();
+        let entries = binding.get(&parent);
 
         //search through directory entries for target file
         if let Some(entries) = entries {
@@ -508,6 +510,7 @@ impl Filesystem for FuseFS {
     //create a symbolic link
     //TODO i need a mutable reference to self here, but that goes against the trait requirement. what do?
     fn symlink(&self, _req: &Request, parent: INodeNo, link_name: &OsStr, target: &Path, reply: ReplyEntry){
+
         // check if there is space in the inode table, if there is reserve the space
         let free_inode_idx = self.allocate_inode();
         //no space in inode table
@@ -526,7 +529,7 @@ impl Filesystem for FuseFS {
 
         //store target link path as slice of bytes in data region 
         let path_bytes = target.as_os_str().as_encoded_bytes();
-        let offset = sefl.offset_from_block_idx(block_idx);
+        let offset = self.offset_from_block_idx(block_idx);
 
         //try to write the path into a data block
         let res = self.block_store_fd.write_at(path_bytes, offset);
@@ -575,7 +578,7 @@ impl Filesystem for FuseFS {
         //store inode in inode table
         self.inode_table[inode_idx as usize] = symlink_attrs;
 
-        //also add it to the directory
+        //also add it to the parent directory
         self.dir_entries
             .write()
             .unwrap()
@@ -606,12 +609,12 @@ impl Filesystem for FuseFS {
         }
 
         //get inode from inode table 
-        let mut inode = &mut self.inode_table[ino.0 as usize];
+        let inode = &mut self.inode_table[ino.0 as usize];
 
         //increment the hardlinks counter in inode
         inode.hardlinks = inode.hardlinks + 1;
 
-        //create a new entry in the directory as well
+        //create a new entry in the parent directory
         self.dir_entries
             .write()
             .unwrap()
@@ -619,7 +622,6 @@ impl Filesystem for FuseFS {
             .or_insert_with(Vec::new)
             .push((ino.0, newname.to_string_lossy().to_string()));
 
-        //return hardlink as fuser fileattr
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap();
@@ -630,6 +632,8 @@ impl Filesystem for FuseFS {
             FileKind::Symlink => fuser::FileType::Symlink,
         };
 
+
+        //return hardlink as fuser fileattr
         let attrs = fuser::FileAttr{
             ino: ino,
             size: inode.size,
@@ -698,8 +702,9 @@ impl Filesystem for FuseFS {
 
     //remove a file
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty){
-        //lookup the file in its directory
+        //lookup the file to get the inode number
         let target_inode_no = self.find_dir_entry(parent.0, name);
+
         //if target does not exist, can't unlink
         if target_inode_no.is_none(){
             return reply.error(Errno::ENOENT);
@@ -707,7 +712,7 @@ impl Filesystem for FuseFS {
         let inode_no = target_inode_no.unwrap();
 
         //lookup the inode in the inode table
-        let mut inode = &mut self.inode_table[inode_no as usize];
+        let inode = &mut self.inode_table[inode_no as usize];
 
         let hardlinks = inode.hardlinks;
         let extent_idx = inode.extent_index;
@@ -717,7 +722,9 @@ impl Filesystem for FuseFS {
 
         //remove from parent directory
         //had to use claude for this part D:
-        if let Some(entries) = self.dir_entries.write().unwrap().get_mut(&parent.0){
+        let binding = self.dir_entries.read().unwrap();
+
+        if let Some(entries) = binding.get_mut(&parent.0){
             let mut i = 0;
             while i < entries.len(){
                 if entries[i].1.as_str() == name.to_string_lossy().as_ref(){
@@ -730,7 +737,7 @@ impl Filesystem for FuseFS {
         }
 
         //if there are no more links, release the data
-        if hardlinks <= 0{
+        if inode.hardlinks <= 0{
             //mark the inode as free in inode table
             self.free_inode(inode_no);
 
@@ -756,7 +763,7 @@ impl Filesystem for FuseFS {
     }
 
     //Create file node. Create a regular file, character device, block device, fifo or socket node.
-    fn mknod(&self, _req: &Request, parent: INodeNo, name: &OsStr,  mode: u32, umask: u32, rdev: u32, reply: ReplyEmpty){
+    fn mknod(&self, _req: &Request, _parent: INodeNo, _name: &OsStr,  _mode: u32, _umask: u32, _rdev: u32, reply: ReplyEntry){
         //don't need to deal with special files for now
         //just return an error unless we decide to work with special files
         reply.error(Errno::ENOSYS);
