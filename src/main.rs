@@ -158,7 +158,7 @@ impl FuseFS {
         FuseFS::new(fd, 4096, 32768, 32768)
     }
 
-    // TODO search for next free space in the inode table using bitmap
+    // search for next free space in the inode table using bitmap
     // if space is available, return the offset of the free block from the start of data region
     // return None if there is no space in the data region
     fn next_free_inode(&self) -> Option<u64> { 
@@ -226,15 +226,12 @@ impl FuseFS {
         }
     }
 
-    // TODO allocate data block based on available space in the data region
+    // allocate data block based on available space in the data region
     fn allocate_block(&mut self) -> Option<u64>{
         // get the index of the next free data block 
         let free_idx = self.next_free_block();
 
         if let Some(idx) = free_idx{
-            // allocate block it
-            //TODO need to make some logic to write to data region
-    
             // mark it as allocated
             let chunk = (idx / 1024) as usize; // compiler doesn't like it without casting for some reason??
             let bit = (idx % 1024) as usize;
@@ -249,6 +246,35 @@ impl FuseFS {
         }
     }
 
+    //clear the bitmap bit for a space in the inode table
+    fn free_inode(&mut self, inode_idx: u64){
+        let chunk = (inode_idx / 1024) as usize; 
+        let bit = (inode_idx % 1024) as usize;
+
+        //dont deallocate anyhing out of bounds
+        if chunk >= self.inode_bitmap.len(){
+            return;
+        } 
+
+        //clear bit in inode bitmap
+        self.inode_bitmap[chunk].set(bit, false);
+    }
+
+    //clear the data bitmap bit for some space in the data region
+    fn free_block(&mut self, block_idx: u64){
+        let chunk = (block_idx / 1024) as usize; 
+        let bit = (block_idx % 1024) as usize;
+
+        //dont deallocate anyhing out of bounds
+        if chunk >= self.data_bitmap.len(){
+            return;
+        }
+
+        //clear bit in data bitmap
+        self.data_bitmap[chunk].set(bit, false);
+        
+    }
+
     //number of blocks allocated for file 
     fn blocks_allocated(&self, inode_size: u64) -> u64{
         (inode_size + self.superblock.block_size as u64 - 1) / self.superblock.block_size as u64
@@ -259,6 +285,22 @@ impl FuseFS {
         self.superblock.data_start + (block_idx * self.superblock.block_size as u64);
     }
 
+    //find a entry in a directory
+    fn find_dir_entry(&self, parent: u64, target_name: &OsStr) -> Option<u64>{
+        //get files in directory based on directory inode number
+        let entries = self.dir_entries.read().unwrap().get(&parent);
+
+        //search through directory entries for target file
+        if let Some(entries) = entries {
+            for (inode_number, entry_name) in entries.iter(){
+                if entry_name.as_str() == target_name.to_string_lossy().as_ref(){
+                    return Some(*inode_number);
+                }
+            }
+        }
+
+        return None;
+    }
 
 }
 
@@ -654,17 +696,58 @@ impl Filesystem for FuseFS {
         reply.data(&path_bytes[..bytes_read]);
     }
 
-    //TODO remove a file
+    //remove a file
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty){
-        //get the file using lookup
+        //lookup the file in its directory
+        let target_inode_no = self.find_dir_entry(parent.0, name);
+        //if target does not exist, can't unlink
+        if target_inode_no.is_none(){
+            return reply.error(Errno::ENOENT);
+        }
+        let inode_no = target_inode_no.unwrap();
 
-        //mark the entry in the inode table storing this link as free
+        //lookup the inode in the inode table
+        let mut inode = &mut self.inode_table[inode_no as usize];
+
+        let hardlinks = inode.hardlinks;
+        let extent_idx = inode.extent_index;
+
         //decrement the number of links to the inode
-        //remove it from the directory it's in
+        inode.hardlinks = hardlinks - 1;
+
+        //remove from parent directory
+        //had to use claude for this part D:
+        if let Some(entries) = self.dir_entries.write().unwrap().get_mut(&parent.0){
+            let mut i = 0;
+            while i < entries.len(){
+                if entries[i].1.as_str() == name.to_string_lossy().as_ref(){
+                    entries.remove(i);
+                    break;
+                }
+
+                i += 1;
+            }
+        }
+
         //if there are no more links, release the data
+        if hardlinks <= 0{
+            //mark the inode as free in inode table
+            self.free_inode(inode_no);
+
+            //clear all data in data region used by file
+            for(start_block, length) in extent_idx{
+                if start_block != 0{
+                    for block_idx in start_block..(start_block + length){
+                        self.free_block(block_idx);
+                    }
+                }
+            }
+        }
+
+        reply.ok();
     }
   
-    //TODO 
+    //release the data when there are no more links
     fn release(&self, _req: &Request, _ino: INodeNo, _fh: FileHandle, _flags: OpenFlags, _lock_owner: Option<LockOwner>, _flush: bool, reply: ReplyEmpty){
         //nothing to release because we're using a file for our data region
         //just need to make sure the data in the data region is marked as free
@@ -675,7 +758,8 @@ impl Filesystem for FuseFS {
     //Create file node. Create a regular file, character device, block device, fifo or socket node.
     fn mknod(&self, _req: &Request, parent: INodeNo, name: &OsStr,  mode: u32, umask: u32, rdev: u32, reply: ReplyEmpty){
         //don't need to deal with special files for now
-        Errno::ENOSYS
+        //just return an error unless we decide to work with special files
+        reply.error(Errno::ENOSYS);
     }
 }
 
