@@ -13,7 +13,6 @@ use std::ffi::OsStr;
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-
 use log::LevelFilter;
 use log::debug;
 use log::error;
@@ -109,7 +108,7 @@ struct InodeAttributes {
 }
 
 // Table (flat data structure: a vector) with inodes.
-type InodeTable = Vec<InodeAttributes>;
+type InodeTable = RwLock<Vec<InodeAttributes>>;
 
 struct FuseFS {
     superblock: Superblock,
@@ -130,7 +129,7 @@ impl FuseFS {
         // TODO: Check if this syntax actually does what you want it to do.
         let inode_bitmap = vec![Bitmap::<1024>::new(); num_inodes as usize / 1024];
         let data_bitmap = vec![Bitmap::<1024>::new(); num_blocks as usize / 1024];
-        let inode_table = vec![InodeAttributes::default(); num_inodes as usize];
+        let inode_table = RwLock::new(vec![InodeAttributes::default(); num_inodes as usize]);
         FuseFS {
             superblock,
             inode_bitmap,
@@ -207,7 +206,7 @@ impl FuseFS {
     }
 
     // allocate an inode basd on available space in the inode table
-    fn allocate_inode(&mut self) -> Option<u64>{
+    fn allocate_inode(&self) -> Option<u64>{
         // get the index of the next free inode
         let free_idx = self.next_free_inode();
 
@@ -215,7 +214,9 @@ impl FuseFS {
             // mark it as allocated
             let chunk = (idx / 1024) as usize; // compiler doesn't like it without casting for some reason??
             let bit = (idx % 1024) as usize;
-            self.inode_bitmap[chunk].set(bit, true);
+
+            let mut bitmap_chunk = self.inode_bitmap[chunk];
+            bitmap_chunk.set(bit, true);
 
             // return the location that the data was allocated at
             return Some(idx);
@@ -227,7 +228,7 @@ impl FuseFS {
     }
 
     // allocate data block based on available space in the data region
-    fn allocate_block(&mut self) -> Option<u64>{
+    fn allocate_block(&self) -> Option<u64>{
         // get the index of the next free data block 
         let free_idx = self.next_free_block();
 
@@ -235,7 +236,8 @@ impl FuseFS {
             // mark it as allocated
             let chunk = (idx / 1024) as usize; // compiler doesn't like it without casting for some reason??
             let bit = (idx % 1024) as usize;
-            self.data_bitmap[chunk].set(bit, true);
+            let mut bitmap_chunk = self.data_bitmap[chunk];
+            bitmap_chunk.set(bit, true);
 
             // return the location that the data was allocated at
             return Some(idx);
@@ -285,9 +287,15 @@ impl FuseFS {
        return self.superblock.data_start + (block_idx * self.superblock.block_size as u64);
     }
 
+    //store inode in inode table at inode_idx
+    fn set_inode_table(&self, inode_idx: u64, data: InodeAttributes){
+        if let Some(ino) = self.inode_table.write().unwrap().get_mut(inode_idx as usize){
+            *ino = data;
+        }
+    }
+
     //find a entry in a directory
     fn find_dir_entry(&self, parent: u64, target_name: &OsStr) -> Option<u64>{
-
         //get files in directory based on directory inode number
         let binding = self.dir_entries.read().unwrap();
         let entries = binding.get(&parent);
@@ -310,17 +318,17 @@ impl FuseFS {
 impl Filesystem for FuseFS {
     // TODO: Fill out this stuff.
 
-    //Adding init
+    //initialize filesystem. called before any other filesystem method.
     fn init(&mut self, _req: &Request, _config: &mut fuser::KernelConfig) -> Result<(), std::io::Error> {
         info!("Filesystem mounted successfully");
 
         // Set up root directory as inode 1
-        let root_inode = 1usize;
-        let chunk = root_inode / 1024;
-        let bit = root_inode % 1024;
+        let root_inode_idx = 1usize;
+        let chunk = root_inode_idx / 1024;
+        let bit = root_inode_idx % 1024;
         self.inode_bitmap[chunk].set(bit, true);
-        self.inode_table[root_inode] = InodeAttributes {
-            inode: root_inode as u64,
+        let root_inode = InodeAttributes{
+            inode: root_inode_idx as u64,
             size: 0,
             kind: FileKind::Directory,
             mode: 0o755,
@@ -329,10 +337,12 @@ impl Filesystem for FuseFS {
             gid: 0,
             ..Default::default()
         };
+        //insert into inode table
+        self.set_inode_table(root_inode_idx as u64, root_inode);
         Ok(())
     }
 
-    // Add getattr
+    // get file attributes
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: fuser::ReplyAttr) {
         let chunk = ino.0 as usize / 1024;
         let bit = ino.0 as usize % 1024;
@@ -352,7 +362,12 @@ impl Filesystem for FuseFS {
         }
 
         // Look up the inode in the table
-        let inode = &self.inode_table[ino.0 as usize];
+        let binding: &std::sync::RwLockReadGuard<'_, Vec<InodeAttributes>> = &self.inode_table.read().unwrap();
+        let inode = match binding.get(ino.0 as usize){
+            Some(ino) => ino,
+            None => return reply.error(Errno::EINVAL)
+        };
+        
 
         let kind = match inode.kind {
             FileKind::File => fuser::FileType::RegularFile,
@@ -385,7 +400,7 @@ impl Filesystem for FuseFS {
         reply.attr(&std::time::Duration::from_secs(1), &attrs);
     }
 
-    //Adding readdir
+    // read directory
     fn readdir(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64, mut reply: fuser::ReplyDirectory) {
         if ino.0 != 1 {
             reply.error(Errno::ENOENT);
@@ -413,7 +428,8 @@ impl Filesystem for FuseFS {
         reply.ok();
     }
 
-    // Adding lookup, need lookup before implementing create
+    // look up a directory entry by name and get it's attributes
+    // need lookup before implementing create
     fn lookup(&self, _req: &Request, parent: INodeNo, _name: &OsStr, reply: fuser::ReplyEntry) {
         // For now only handle lookups in the root directory
         if parent.0 != 1 {
@@ -422,8 +438,10 @@ impl Filesystem for FuseFS {
         }
 
         // Search the inode table for a matching name, still need work
-        for inode in &self.inode_table {
+        let inode_table_binding = self.inode_table.read().unwrap();
+        for inode in inode_table_binding.iter() {
             if inode.hardlinks > 0 {
+                //TODO do something for hardlinks > 0
                 
             }
         }
@@ -432,7 +450,7 @@ impl Filesystem for FuseFS {
         reply.error(Errno::ENOENT);
     }
 
-    //Adding create
+    //create and open a file
     fn create(&self, _req: &Request, parent: INodeNo, name: &OsStr,
           _mode: u32, _umask: u32, _flags: i32, reply: fuser::ReplyCreate) {
 
@@ -482,7 +500,7 @@ impl Filesystem for FuseFS {
         );
     }
     
-    // Adding read and write, still needs much work
+    // read data
     fn read(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64,
             size: u32, _flags: OpenFlags, _lock: Option<LockOwner>, reply: ReplyData) {
         // check if inode really exist
@@ -506,9 +524,7 @@ impl Filesystem for FuseFS {
         }
     }
 
-    //carlos todo
     //create a symbolic link
-    //TODO i need a mutable reference to self here, but that goes against the trait requirement. what do?
     fn symlink(&self, _req: &Request, parent: INodeNo, link_name: &OsStr, target: &Path, reply: ReplyEntry){
 
         // check if there is space in the inode table, if there is reserve the space
@@ -547,7 +563,6 @@ impl Filesystem for FuseFS {
             mode: 0o644,
             uid: _req.uid(),
             gid: _req.gid(),
-            //TODO not sure if this is right?
             extent_index: [(block_idx, 1), (0,0), (0,0), (0,0), (0,0), (0,0), (0,0), (0,0)],
             ..Default::default()
         };
@@ -576,7 +591,7 @@ impl Filesystem for FuseFS {
         };
 
         //store inode in inode table
-        self.inode_table[inode_idx as usize] = symlink_attrs;
+        self.set_inode_table(inode_idx, symlink_attrs);
 
         //also add it to the parent directory
         self.dir_entries
@@ -609,7 +624,11 @@ impl Filesystem for FuseFS {
         }
 
         //get inode from inode table 
-        let inode = &mut self.inode_table[ino.0 as usize];
+        let mut inode_table_binding = self.inode_table.write().unwrap();
+        let inode: &mut InodeAttributes = match inode_table_binding.get_mut(ino.0 as usize){
+            Some(ino) => ino,
+            None => return reply.error(Errno::EINVAL)
+        };
 
         //increment the hardlinks counter in inode
         inode.hardlinks = inode.hardlinks + 1;
@@ -674,7 +693,11 @@ impl Filesystem for FuseFS {
         }
 
         //also make sure its a symlink
-        let inode = &self.inode_table[ino.0 as usize];
+        let inode_table_binding = self.inode_table.read().unwrap();
+        let inode = match inode_table_binding.get(ino.0 as usize){
+            Some(ino) => ino,
+            None => return reply.error(Errno::EINVAL)
+        };
         if inode.kind != FileKind::Symlink{
             return reply.error(Errno::EINVAL);
         }
@@ -712,7 +735,11 @@ impl Filesystem for FuseFS {
         let inode_no = target_inode_no.unwrap();
 
         //lookup the inode in the inode table
-        let inode = &mut self.inode_table[inode_no as usize];
+        let mut inode_table_binding = self.inode_table.write().unwrap();
+        let inode = match inode_table_binding.get_mut(inode_no as usize){
+            Some(ino) => ino,
+            None => return reply.error(Errno::EINVAL)
+        };
 
         let hardlinks = inode.hardlinks;
         let extent_idx = inode.extent_index;
@@ -722,9 +749,8 @@ impl Filesystem for FuseFS {
 
         //remove from parent directory
         //had to use claude for this part D:
-        let binding = self.dir_entries.read().unwrap();
-
-        if let Some(entries) = binding.get_mut(&parent.0){
+        let mut dir_entries_binding = self.dir_entries.write().unwrap();
+        if let Some(entries) = dir_entries_binding.get_mut(&parent.0){
             let mut i = 0;
             while i < entries.len(){
                 if entries[i].1.as_str() == name.to_string_lossy().as_ref(){
@@ -739,7 +765,7 @@ impl Filesystem for FuseFS {
         //if there are no more links, release the data
         if inode.hardlinks <= 0{
             //mark the inode as free in inode table
-            self.free_inode(inode_no);
+            self.free_inode(inode.inode);
 
             //clear all data in data region used by file
             for(start_block, length) in extent_idx{
@@ -754,20 +780,6 @@ impl Filesystem for FuseFS {
         reply.ok();
     }
   
-    //release the data when there are no more links
-    fn release(&self, _req: &Request, _ino: INodeNo, _fh: FileHandle, _flags: OpenFlags, _lock_owner: Option<LockOwner>, _flush: bool, reply: ReplyEmpty){
-        //nothing to release because we're using a file for our data region
-        //just need to make sure the data in the data region is marked as free
-        //this is done in unlink already
-        reply.ok()
-    }
-
-    //Create file node. Create a regular file, character device, block device, fifo or socket node.
-    fn mknod(&self, _req: &Request, _parent: INodeNo, _name: &OsStr,  _mode: u32, _umask: u32, _rdev: u32, reply: ReplyEntry){
-        //don't need to deal with special files for now
-        //just return an error unless we decide to work with special files
-        reply.error(Errno::ENOSYS);
-    }
 }
 
 #[derive(Parser)]
@@ -952,6 +964,7 @@ mod tests {
     }
 
     #[test]
+    //verify properties of newly-initialized fs
     fn test_new_filesystem_creation() {
         let tmp = NamedTempFile::new().unwrap();
         let fd = tmp.reopen().unwrap();
@@ -960,9 +973,10 @@ mod tests {
         assert_eq!(fs.superblock.block_size, 4096);
         assert_eq!(fs.superblock.num_inodes, 1024);
         assert_eq!(fs.superblock.num_blocks, 1024);
+        let inode_table_binding = fs.inode_table.read().unwrap();
         // All inodes should be unallocated initially
-        assert_eq!(fs.inode_table.len(), 1024);
-        assert!(fs.inode_table.iter().all(|i| i.inode == 0));
+        assert_eq!(inode_table_binding.len(), 1024);
+        assert!(inode_table_binding.iter().all(|i| i.inode == 0));
     }
 
     #[test]
@@ -979,6 +993,7 @@ mod tests {
     }
 
     #[test]
+    //check attributes of default inode
     fn test_inode_attributes_default() {
         let inode = InodeAttributes::default();
         assert_eq!(inode.kind, FileKind::File);
@@ -987,30 +1002,33 @@ mod tests {
     }
 
     #[test]
+    //ensure empty inode bitmap for a newly-initialized fs
     fn test_getattr_unallocated_inode_returns_none() {
         let tmp = NamedTempFile::new().unwrap();
         let fd = tmp.reopen().unwrap();
         let fs = FuseFS::new(fd, 4096, 1024, 1024);
 
-        // No inodes allocated yet, every bit should be unset
+        //no inodes allocated yet, every bit should be unset
         let chunk = 0;
         let bit = 0;
         assert!(!fs.inode_bitmap[chunk].get(bit), "bitmap should be empty on a new filesystem");
     }
 
     #[test]
+    //simulate initialization of root inode
     fn test_readdir_root_inode_is_directory() {
         let tmp = NamedTempFile::new().unwrap();
         let fd = tmp.reopen().unwrap();
         let mut fs = FuseFS::new(fd, 4096, 1024, 1024);
 
         // Simulate what init() does - set up root inode
-        let root_inode = 1usize;
-        let chunk = root_inode / 1024;
-        let bit = root_inode % 1024;
+        let root_inode_idx = 1usize;
+        let chunk = root_inode_idx / 1024;
+        let bit = root_inode_idx % 1024;
         fs.inode_bitmap[chunk].set(bit, true);
-        fs.inode_table[root_inode] = InodeAttributes {
-            inode: root_inode as u64,
+        
+        let root_inode = InodeAttributes {
+            inode: root_inode_idx as u64,
             size: 0,
             kind: FileKind::Directory,
             mode: 0o755,
@@ -1019,26 +1037,39 @@ mod tests {
             gid: 0,
             ..Default::default()
         };
+        fs.set_inode_table(root_inode_idx as u64, root_inode);
 
         // Verify root inode is allocated in bitmap
         assert!(fs.inode_bitmap[chunk].get(bit), "root inode should be allocated");
 
+        let inode_table_binding = fs.inode_table.read().unwrap();
+        let expect_root_inode = match inode_table_binding.get(root_inode_idx){
+            Some(ino) => ino,
+            None => &InodeAttributes { 
+                inode: 0, 
+                hardlinks: 0,
+                mode: 0,
+                ..Default::default()
+            }
+        };
         // Verify root inode is a directory
-        assert_eq!(fs.inode_table[root_inode].kind, FileKind::Directory);
+        assert_eq!(expect_root_inode.kind, FileKind::Directory);
 
         // Verify root inode has correct hardlinks
-        assert_eq!(fs.inode_table[root_inode].hardlinks, 2);
+        assert_eq!(expect_root_inode.hardlinks, 2);
 
         // Verify permissions
-        assert_eq!(fs.inode_table[root_inode].mode, 0o755);
+        assert_eq!(expect_root_inode.mode, 0o755);
     }   
 
 
     #[test]
+    //try to allocate space for an inode in an empty inode table
+    //first space should be empty
     fn test_next_free_inode_empty_fs() {
         let tmp = NamedTempFile::new().unwrap();
         let fd = tmp.reopen().unwrap();
-        let mut fs = FuseFS::new(fd, 4096, 1024, 1024);
+        let fs = FuseFS::new(fd, 4096, 1024, 1024);
 
         //verify that the first space in inode table is free for a new fs
         let first_free_inode = fs.next_free_inode();
@@ -1046,14 +1077,15 @@ mod tests {
         
     }
     #[test]
+    //try to allocate space for an inode in a full inode table
+    //should indicate that no spaces are free
     fn test_next_free_inode_full_fs() {
         let tmp = NamedTempFile::new().unwrap();
         let fd = tmp.reopen().unwrap();
-        let mut fs = FuseFS::new(fd, 4096, 1024, 1024);
+        let fs = FuseFS::new(fd, 4096, 1024, 1024);
 
-        //fill the bitmap using allocate_indode()
-        //TODO verify that this logic is correct
-        for i in 0..fs.superblock.num_inodes{
+        //fill the bitmap using allocate_inode()
+        for _i in 0..fs.superblock.num_inodes{
             fs.allocate_inode();
         }
 
@@ -1063,23 +1095,24 @@ mod tests {
 
 
     #[test]
+    //try to allocate a data block in an empty data region
     fn test_next_free_block_empty_fs() {
         let tmp = NamedTempFile::new().unwrap();
         let fd = tmp.reopen().unwrap();
-        let mut fs = FuseFS::new(fd, 4096, 1024, 1024);
+        let fs = FuseFS::new(fd, 4096, 1024, 1024);
 
         let first_free_block = fs.next_free_block();
         assert_eq!(first_free_block, Some(0));
     }
     #[test]
+    //try to allocate a data block in a full data region
     fn test_next_free_block_full_fs() {
         let tmp = NamedTempFile::new().unwrap();
         let fd = tmp.reopen().unwrap();
-        let mut fs = FuseFS::new(fd, 4096, 1024, 1024);
+        let fs = FuseFS::new(fd, 4096, 1024, 1024);
 
         //fill the bitmap using allocate_block()
-        //TODO verify that this logic is correct
-        for i in 0..fs.superblock.num_blocks{
+        for _i in 0..fs.superblock.num_blocks{
             fs.allocate_block();
         }
 
@@ -1088,12 +1121,13 @@ mod tests {
     }
 
     #[test]
+    //allocate an inode and check that the bitmap bit is set
+    //remaining nodes should be free
     fn test_allocate_inode_sets_bitmap() {
         let tmp = NamedTempFile::new().unwrap();
         let fd = tmp.reopen().unwrap();
-        let mut fs = FuseFS::new(fd, 4096, 1024, 1024);
+        let fs = FuseFS::new(fd, 4096, 1024, 1024);
 
-        // Allocate an inode and check the bit is set
         let inode_num = fs.allocate_inode().expect("should have free inodes");
         let chunk = (inode_num / 1024) as usize;
         let bit = (inode_num % 1024) as usize;
@@ -1101,12 +1135,12 @@ mod tests {
     }
 
     #[test]
+    //two inode allocations should return different inodes
     fn test_allocate_inode_returns_different_inodes() {
         let tmp = NamedTempFile::new().unwrap();
         let fd = tmp.reopen().unwrap();
-        let mut fs = FuseFS::new(fd, 4096, 1024, 1024);
+        let fs = FuseFS::new(fd, 4096, 1024, 1024);
 
-        // Two allocations should return different inodes
         let inode1 = fs.allocate_inode().expect("should have free inodes");
         let inode2 = fs.allocate_inode().expect("should still have free inodes");
         assert_ne!(inode1, inode2, "should not allocate the same inode twice");
@@ -1116,7 +1150,7 @@ mod tests {
     fn test_allocate_block_sets_bitmap() {
         let tmp = NamedTempFile::new().unwrap();
         let fd = tmp.reopen().unwrap();
-        let mut fs = FuseFS::new(fd, 4096, 1024, 1024);
+        let fs = FuseFS::new(fd, 4096, 1024, 1024);
 
         // Allocate a block and check the bit is set
         let block_num = fs.allocate_block().expect("should have free blocks");
@@ -1129,7 +1163,7 @@ mod tests {
     fn test_allocate_block_returns_different_blocks() {
         let tmp = NamedTempFile::new().unwrap();
         let fd = tmp.reopen().unwrap();
-        let mut fs = FuseFS::new(fd, 4096, 1024, 1024);
+        let fs = FuseFS::new(fd, 4096, 1024, 1024);
 
         // Two allocations should return different blocks
         let block1 = fs.allocate_block().expect("should have free blocks");
@@ -1141,14 +1175,14 @@ mod tests {
     fn test_allocate_inode_returns_none_when_full() {
         let tmp = NamedTempFile::new().unwrap();
         let fd = tmp.reopen().unwrap();
-        let mut fs = FuseFS::new(fd, 4096, 1024, 1024);
+        let fs = FuseFS::new(fd, 4096, 1024, 1024);
 
-        // Fill up all inodes
+        //fill up all inodes
         for _ in 0..1024 {
             fs.allocate_inode().expect("should have free inodes");
         }
 
-        // Next allocation should return None
+        //attempt at allocation should return None
         assert!(fs.allocate_inode().is_none(), "should return None when all inodes are used");
     }
 }
