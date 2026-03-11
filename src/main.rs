@@ -112,8 +112,8 @@ type InodeTable = RwLock<Vec<InodeAttributes>>;
 
 struct FuseFS {
     superblock: Superblock,
-    inode_bitmap: Vec<Bitmap<1024>>,
-    data_bitmap: Vec<Bitmap<1024>>,
+    inode_bitmap: RwLock<Vec<Bitmap<1024>>>,
+    data_bitmap: RwLock<Vec<Bitmap<1024>>>,
     inode_table: InodeTable,
     block_store_fd: File,
     dir_entries: RwLock<HashMap<u64, Vec<(u64, String)>>>,
@@ -127,8 +127,8 @@ impl FuseFS {
         debug!("Creating filesystem..");
         let superblock = Superblock::new(block_size, num_inodes, num_blocks);
         // TODO: Check if this syntax actually does what you want it to do.
-        let inode_bitmap = vec![Bitmap::<1024>::new(); num_inodes as usize / 1024];
-        let data_bitmap = vec![Bitmap::<1024>::new(); num_blocks as usize / 1024];
+        let inode_bitmap = RwLock::new(vec![Bitmap::<1024>::new(); num_inodes as usize / 1024]);
+        let data_bitmap = RwLock::new(vec![Bitmap::<1024>::new(); num_blocks as usize / 1024]);
         let inode_table = RwLock::new(vec![InodeAttributes::default(); num_inodes as usize]);
         FuseFS {
             superblock,
@@ -163,8 +163,9 @@ impl FuseFS {
     fn next_free_inode(&self) -> Option<u64> { 
         let bit_per_chunk = 1024;
 
+        let inode_bitmap_binding = self.inode_bitmap.read().unwrap();
         // search one bitmap chunk at a time
-        for (chunk_idx, chunk) in self.inode_bitmap.iter().enumerate(){
+        for (chunk_idx, chunk) in inode_bitmap_binding.iter().enumerate(){
             // check each bit until we find a free space
             let mut i = 0;
             while i < bit_per_chunk && chunk.get(i){
@@ -187,8 +188,10 @@ impl FuseFS {
     fn next_free_block(&self) -> Option<u64> { 
         let bit_per_chunk = 1024;
 
-        // search one bitmap chunk at a time
-        for (chunk_idx, chunk) in self.data_bitmap.iter().enumerate(){
+
+        // search bitmap one chunk at a time
+        let data_bitmap_binding = self.data_bitmap.read().unwrap();
+        for (chunk_idx, chunk) in data_bitmap_binding.iter().enumerate(){
             // check each bit until we find a free space
             let mut i = 0;
             while i < bit_per_chunk && chunk.get(i){
@@ -211,11 +214,15 @@ impl FuseFS {
         let free_idx = self.next_free_inode();
 
         if let Some(idx) = free_idx{
-            // mark it as allocated
             let chunk = (idx / 1024) as usize; // compiler doesn't like it without casting for some reason??
             let bit = (idx % 1024) as usize;
 
-            let mut bitmap_chunk = self.inode_bitmap[chunk];
+            // mark inode bitmap slot as allocated
+            let mut bitmap_binding = self.inode_bitmap.write().unwrap();
+            let bitmap_chunk = match bitmap_binding.get_mut(chunk){
+                Some(slot) => slot,
+                None => return None
+            };
             bitmap_chunk.set(bit, true);
 
             // return the location that the data was allocated at
@@ -234,9 +241,15 @@ impl FuseFS {
 
         if let Some(idx) = free_idx{
             // mark it as allocated
-            let chunk = (idx / 1024) as usize; // compiler doesn't like it without casting for some reason??
+            let chunk = (idx / 1024) as usize; 
             let bit = (idx % 1024) as usize;
-            let mut bitmap_chunk = self.data_bitmap[chunk];
+
+            let mut bitmap_binding = self.data_bitmap.write().unwrap();
+            let bitmap_chunk = match bitmap_binding.get_mut(chunk){
+                Some(slot) => slot,
+                None => return None
+            };
+            
             bitmap_chunk.set(bit, true);
 
             // return the location that the data was allocated at
@@ -249,32 +262,61 @@ impl FuseFS {
     }
 
     //clear the bitmap bit for a space in the inode table
-    fn free_inode(&mut self, inode_idx: u64){
+    fn free_inode(&self, inode_idx: u64){
         let chunk = (inode_idx / 1024) as usize; 
         let bit = (inode_idx % 1024) as usize;
 
+        //bitmap structure uses chunks of 1024 bits
+        let inodes_per_bitmap_chunk = 1024usize;
+
         //dont deallocate anyhing out of bounds
-        if chunk >= self.inode_bitmap.len(){
-            return;
+        if chunk >= (self.superblock.num_inodes as usize / inodes_per_bitmap_chunk){
+            debug!("couldn't free out of bounds chunk from inode table");
+            return; 
         } 
 
+        //get inode bitmap chunk
+        let mut inode_bitmap_binding = self.inode_bitmap.write().unwrap();
+        let bitmap_chunk = match inode_bitmap_binding.get_mut(chunk){
+            Some(slot) => slot,
+            None => {
+                debug!("couldn't free bit in inode bitmap");
+                return;
+            }
+        };
+
+
         //clear bit in inode bitmap
-        self.inode_bitmap[chunk].set(bit, false);
+        bitmap_chunk.set(bit, false);
+        return 
     }
 
     //clear the data bitmap bit for some space in the data region
-    fn free_block(&mut self, block_idx: u64){
+    fn free_block(&self, block_idx: u64){
         let chunk = (block_idx / 1024) as usize; 
         let bit = (block_idx % 1024) as usize;
 
+        let blocks_per_bitmap_chunk= 1024usize;
+
         //dont deallocate anyhing out of bounds
-        if chunk >= self.data_bitmap.len(){
-            return;
+        if chunk >= (self.superblock.num_blocks as usize / blocks_per_bitmap_chunk){
+            debug!("chunk out of bounds, couldn't free data bitmap chunk");
+            return
         }
 
+        //get data bitmap chunk
+        let mut data_bitmap_binding = self.data_bitmap.write().unwrap();
+        let bitmap_chunk = match data_bitmap_binding.get_mut(chunk){
+            Some(slot) => slot,
+            None => {
+                debug!("couldn't free bit in data bitmap");
+                return
+            }
+        };
+
         //clear bit in data bitmap
-        self.data_bitmap[chunk].set(bit, false);
-        
+        bitmap_chunk.set(bit, false);
+        return;
     }
 
     //number of blocks allocated for file 
@@ -312,6 +354,22 @@ impl FuseFS {
         return None;
     }
 
+    fn decrement_links(&self,inode_no: u64) -> Option<(u32, [Extent; 8])>{
+      //get the inode from the inode table
+        let mut inode_table_binding = self.inode_table.write().unwrap();
+        let inode = match inode_table_binding.get_mut(inode_no as usize){
+            Some(ino) => ino,
+            None => return None
+        };
+
+        let hardlinks = inode.hardlinks;
+        let extent_idx = inode.extent_index;
+
+        inode.hardlinks = hardlinks - 1;
+
+        return Some((hardlinks, extent_idx));
+    }
+
 }
 
 // Implement the Filesystem trait to integrate FuseFS with fuser.
@@ -326,7 +384,17 @@ impl Filesystem for FuseFS {
         let root_inode_idx = 1usize;
         let chunk = root_inode_idx / 1024;
         let bit = root_inode_idx % 1024;
-        self.inode_bitmap[chunk].set(bit, true);
+
+
+        let mut inode_bitmap_binding = self.inode_bitmap.write().unwrap();
+        let bitmap_chunk = match inode_bitmap_binding.get_mut(chunk){
+            Some(slot) => slot,
+            None => return Err(std::io::Error::new(ErrorKind::Other, "failed to get inode bitmap chunk"))
+        };
+
+        //mark bitmap entry as allocated
+        bitmap_chunk.set(bit, true);
+
         let root_inode = InodeAttributes{
             inode: root_inode_idx as u64,
             size: 0,
@@ -347,18 +415,16 @@ impl Filesystem for FuseFS {
         let chunk = ino.0 as usize / 1024;
         let bit = ino.0 as usize % 1024;
 
+        let inode_bitmap_binding = self.inode_bitmap.read().unwrap();
+        let bitmap_chunk = match inode_bitmap_binding.get(chunk){
+            Some(slot) => slot,
+            None => return reply.error(Errno::ENOENT) 
+        };
+
         // Check if inode is allocated in the bitmap
-        match self.inode_bitmap.get(chunk) {
-            None => {
-                reply.error(Errno::ENOENT);
-                return;
-            }
-            Some(bitmap) => {
-                if !bitmap.get(bit) {
-                    reply.error(Errno::ENOENT);
-                    return;
-                }
-            }
+        if !bitmap_chunk.get(bit){
+            reply.error(Errno::ENOENT);
+            return;
         }
 
         // Look up the inode in the table
@@ -503,8 +569,18 @@ impl Filesystem for FuseFS {
     // read data
     fn read(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64,
             size: u32, _flags: OpenFlags, _lock: Option<LockOwner>, reply: ReplyData) {
+
+        let chunk = ino.0 as usize / 1024;
+        let bit = ino.0 as usize % 1024;
+
+        let inode_bitmap_binding = self.inode_bitmap.read().unwrap();
+        let bitmap_chunk = match inode_bitmap_binding.get(chunk){
+            Some(slot) => slot,
+            None => return reply.error(Errno::ENOENT) 
+        };
+
         // check if inode really exist
-        if self.inode_bitmap.get(ino.0 as usize).is_none() {
+        if !bitmap_chunk.get(bit) {
             // If the bit is 0, file doesn't exist
             reply.error(Errno::ENOENT);
             return;
@@ -609,18 +685,16 @@ impl Filesystem for FuseFS {
         let chunk = ino.0 as usize / 1024;
         let bit = ino.0 as usize % 1024;
 
+        let inode_bitmap_binding = self.inode_bitmap.read().unwrap();
+        let bitmap_chunk = match inode_bitmap_binding.get(chunk){
+            Some(slot) => slot,
+            None => return reply.error(Errno::ENOENT) 
+        };
+
         //check that the inode we're trying to link to already exists
-        match self.inode_bitmap.get(chunk) {
-            None => {
+        if !bitmap_chunk.get(bit) {
                 reply.error(Errno::EINVAL);
                 return;
-            }
-            Some(bitmap) => {
-                if !bitmap.get(bit) {
-                    reply.error(Errno::EINVAL);
-                    return;
-                }
-            }
         }
 
         //get inode from inode table 
@@ -679,17 +753,16 @@ impl Filesystem for FuseFS {
         //check if the inode is allocated in the bitmap
         let chunk = ino.0 as usize / 1024;
         let bit = ino.0 as usize % 1024;
-        match self.inode_bitmap.get(chunk) {
-            None => {
-                reply.error(Errno::ENOENT);
-                return;
-            }
-            Some(bitmap) => {
-                if !bitmap.get(bit) {
-                    reply.error(Errno::ENOENT);
-                    return;
-                }
-            }
+
+        let inode_bitmap_binding = self.inode_bitmap.read().unwrap();
+        let bitmap_chunk = match inode_bitmap_binding.get(chunk){
+            Some(slot) => slot,
+            None => return reply.error(Errno::ENOENT) 
+        };
+
+        if !bitmap_chunk.get(bit) {
+            reply.error(Errno::ENOENT);
+            return;
         }
 
         //also make sure its a symlink
@@ -734,21 +807,14 @@ impl Filesystem for FuseFS {
         }
         let inode_no = target_inode_no.unwrap();
 
-        //lookup the inode in the inode table
-        let mut inode_table_binding = self.inode_table.write().unwrap();
-        let inode = match inode_table_binding.get_mut(inode_no as usize){
-            Some(ino) => ino,
+  
+        //decrement the number of hardlinks
+        let (hardlinks, extent_idx)= match self.decrement_links(inode_no){
+            Some((link_no, extent_idx)) => (link_no, extent_idx),
             None => return reply.error(Errno::EINVAL)
         };
 
-        let hardlinks = inode.hardlinks;
-        let extent_idx = inode.extent_index;
-
-        //decrement the number of links to the inode
-        inode.hardlinks = hardlinks - 1;
-
         //remove from parent directory
-        //had to use claude for this part D:
         let mut dir_entries_binding = self.dir_entries.write().unwrap();
         if let Some(entries) = dir_entries_binding.get_mut(&parent.0){
             let mut i = 0;
@@ -761,11 +827,14 @@ impl Filesystem for FuseFS {
                 i += 1;
             }
         }
+        //drop the RwLock for dir_entries
+        drop(dir_entries_binding);
 
-        //if there are no more links, release the data
-        if inode.hardlinks <= 0{
-            //mark the inode as free in inode table
-            self.free_inode(inode.inode);
+
+        //if this was the last link, release the data
+        if hardlinks == 1{
+            //remove the inode from the inode table
+            self.free_inode(inode_no);
 
             //clear all data in data region used by file
             for(start_block, length) in extent_idx{
@@ -1011,7 +1080,13 @@ mod tests {
         //no inodes allocated yet, every bit should be unset
         let chunk = 0;
         let bit = 0;
-        assert!(!fs.inode_bitmap[chunk].get(bit), "bitmap should be empty on a new filesystem");
+
+        let bitmap_binding = fs.inode_bitmap.read().unwrap();
+        if let Some(bitmap_chunk) = bitmap_binding.get(chunk) {
+            assert!(!bitmap_chunk.get(bit), "bitmap should be empty on a new filesystem");
+        } else{
+            assert!(false)
+        }
     }
 
     #[test]
@@ -1019,13 +1094,20 @@ mod tests {
     fn test_readdir_root_inode_is_directory() {
         let tmp = NamedTempFile::new().unwrap();
         let fd = tmp.reopen().unwrap();
-        let mut fs = FuseFS::new(fd, 4096, 1024, 1024);
+        let fs = FuseFS::new(fd, 4096, 1024, 1024);
 
         // Simulate what init() does - set up root inode
         let root_inode_idx = 1usize;
         let chunk = root_inode_idx / 1024;
         let bit = root_inode_idx % 1024;
-        fs.inode_bitmap[chunk].set(bit, true);
+
+        let mut inode_bitmap_binding = fs.inode_bitmap.write().unwrap();
+        if  let Some(bitmap_chunk) = inode_bitmap_binding.get_mut(chunk){
+            bitmap_chunk.set(bit, true);
+        } else{
+            assert!(false);
+        }
+
         
         let root_inode = InodeAttributes {
             inode: root_inode_idx as u64,
@@ -1040,7 +1122,13 @@ mod tests {
         fs.set_inode_table(root_inode_idx as u64, root_inode);
 
         // Verify root inode is allocated in bitmap
-        assert!(fs.inode_bitmap[chunk].get(bit), "root inode should be allocated");
+        if let Some(bitmap_chunk) = inode_bitmap_binding.get(chunk){
+            assert!(bitmap_chunk.get(bit), "root inode should be allocated");
+        }
+        else{
+            assert!(false);
+        }
+
 
         let inode_table_binding = fs.inode_table.read().unwrap();
         let expect_root_inode = match inode_table_binding.get(root_inode_idx){
@@ -1131,7 +1219,16 @@ mod tests {
         let inode_num = fs.allocate_inode().expect("should have free inodes");
         let chunk = (inode_num / 1024) as usize;
         let bit = (inode_num % 1024) as usize;
-        assert!(fs.inode_bitmap[chunk].get(bit), "bitmap bit should be set after allocation");
+
+
+        let inode_bitmap_binding = fs.inode_bitmap.read().unwrap();
+        if let Some(bitmap_chunk) = inode_bitmap_binding.get(chunk){
+            //allocate_inode should mark bit as allocated in bitmap
+            assert!(bitmap_chunk.get(bit), "bitmap bit should be set after allocation");
+        }
+        else{
+            assert!(false);
+        }
     }
 
     #[test]
@@ -1156,7 +1253,15 @@ mod tests {
         let block_num = fs.allocate_block().expect("should have free blocks");
         let chunk = (block_num / 1024) as usize;
         let bit = (block_num % 1024) as usize;
-        assert!(fs.data_bitmap[chunk].get(bit), "bitmap bit should be set after allocation");
+
+        let data_bitmap_binding= fs.data_bitmap.read().unwrap();
+        if let Some(bitmap_chunk) = data_bitmap_binding.get(chunk){
+            //allocate_block should mark bit as allocated in bitmap
+            assert!(bitmap_chunk.get(bit), "bitmap bit should be set after allocation");
+        }
+        else{
+            assert!(false);
+        }
     }
 
     #[test]
