@@ -12,6 +12,8 @@ use clap::Parser;
 use std::ffi::OsStr;
 use std::collections::HashMap;
 use std::sync::RwLock;
+use std::mem::size_of;
+use fuser::WriteFlags;
 
 use log::LevelFilter;
 use log::debug;
@@ -332,7 +334,11 @@ impl FuseFS {
     //store inode in inode table at inode_idx
     fn set_inode_table(&self, inode_idx: u64, data: InodeAttributes){
         if let Some(ino) = self.inode_table.write().unwrap().get_mut(inode_idx as usize){
-            *ino = data;
+            *ino = data.clone();
+        }
+        // persist to disk
+        if let Err(e) = self.write_inode(inode_idx, &data) {
+            error!("failed to write inode {} to disk: {}", inode_idx, e);
         }
     }
 
@@ -370,6 +376,31 @@ impl FuseFS {
         return Some((hardlinks, extent_idx));
     }
 
+    fn write_inode(&self, inode_idx: u64, inode: &InodeAttributes) -> io::Result<()> {
+        // Convert to bytes using bincode
+        let bytes = bincode::serialize(inode)
+            .map_err(|e| io::Error::new(ErrorKind::Other, e))?;
+        
+        // Calculate where inode is written
+        let offset = self.superblock.itable_start 
+            + (inode_idx * size_of::<InodeAttributes>() as u64);
+        // Write at the correct location
+        self.block_store_fd.write_at(&bytes, offset)?;
+        Ok(())
+    }
+
+    fn read_inode(&self, inode_idx: u64) -> io::Result<InodeAttributes> {
+        let offset = self.superblock.itable_start
+            + (inode_idx * size_of::<InodeAttributes>() as u64);
+        
+        // Create buffer and read
+        let mut buf = vec![0u8; size_of::<InodeAttributes>()];
+        self.block_store_fd.read_at(&mut buf, offset)?; 
+        
+        //Convert bytes back, basically reverse of a step in write_inode
+        bincode::deserialize(&buf)
+            .map_err(|e| io::Error::new(ErrorKind::Other, e))
+    }
 }
 
 // Implement the Filesystem trait to integrate FuseFS with fuser.
@@ -468,11 +499,13 @@ impl Filesystem for FuseFS {
 
     // read directory
     fn readdir(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64, mut reply: fuser::ReplyDirectory) {
+        // Error for non-existent directory
         if ino.0 != 1 {
             reply.error(Errno::ENOENT);
             return;
         }
 
+        // Directory entries
         let mut entries = vec![
             (INodeNo(1), fuser::FileType::Directory, ".".to_string()),
             (INodeNo(1), fuser::FileType::Directory, "..".to_string()),
@@ -485,6 +518,7 @@ impl Filesystem for FuseFS {
             }
         }
 
+        // Send back to kernel
         for (i, (inode, kind, name)) in entries.iter().enumerate().skip(offset as usize) {
             if reply.add(*inode, (i + 1) as u64, *kind, name) {
                 break;
@@ -494,45 +528,95 @@ impl Filesystem for FuseFS {
         reply.ok();
     }
 
+    
+
     // look up a directory entry by name and get it's attributes
     // need lookup before implementing create
-    fn lookup(&self, _req: &Request, parent: INodeNo, _name: &OsStr, reply: fuser::ReplyEntry) {
-        // For now only handle lookups in the root directory
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: fuser::ReplyEntry) {
         if parent.0 != 1 {
             reply.error(Errno::ENOENT);
             return;
         }
 
-        // Search the inode table for a matching name, still need work
-        let inode_table_binding = self.inode_table.read().unwrap();
-        for inode in inode_table_binding.iter() {
-            if inode.hardlinks > 0 {
-                //TODO do something for hardlinks > 0
-                
-            }
+        // search dir_entries for the file
+        let inode_no = self.find_dir_entry(parent.0, name);
+        if inode_no.is_none() {
+            reply.error(Errno::ENOENT);
+            return;
         }
+        let inode_no = inode_no.unwrap();
 
-        // No file found
-        reply.error(Errno::ENOENT);
+        // get the inode from the inode table
+        let inode_table_binding = self.inode_table.read().unwrap();
+        let inode = match inode_table_binding.get(inode_no as usize) {
+            Some(ino) => ino,
+            None => return reply.error(Errno::ENOENT),
+        };
+
+        // convert fuser::FileType, important!
+        let kind = match inode.kind {
+            FileKind::File => fuser::FileType::RegularFile,
+            FileKind::Directory => fuser::FileType::Directory,
+            FileKind::Symlink => fuser::FileType::Symlink,
+        };
+
+        // build file attributes from inode data
+        let attrs = fuser::FileAttr {
+            ino: INodeNo(inode_no),
+            size: inode.size,
+            blocks: self.blocks_allocated(inode.size),
+            atime: std::time::UNIX_EPOCH + std::time::Duration::new(inode.last_accessed.0 as u64, inode.last_accessed.1),
+            mtime: std::time::UNIX_EPOCH + std::time::Duration::new(inode.last_modified.0 as u64, inode.last_modified.1),
+            ctime: std::time::UNIX_EPOCH + std::time::Duration::new(inode.last_metadata_changed.0 as u64, inode.last_metadata_changed.1),
+            crtime: std::time::UNIX_EPOCH,
+            kind,
+            perm: inode.mode,
+            nlink: inode.hardlinks,
+            uid: inode.uid,
+            gid: inode.gid,
+            rdev: 0,
+            blksize: self.superblock.block_size,
+            flags: 0,
+        };
+
+        reply.entry(&std::time::Duration::from_secs(1), &attrs, fuser::Generation(0));
     }
 
     //create and open a file
     fn create(&self, _req: &Request, parent: INodeNo, name: &OsStr,
-          _mode: u32, _umask: u32, _flags: i32, reply: fuser::ReplyCreate) {
+      _mode: u32, _umask: u32, _flags: i32, reply: fuser::ReplyCreate) {
 
-        // Only support creating files in root directory for now
         if parent.0 != 1 {
             reply.error(Errno::ENOENT);
             return;
         }
 
+        // allocate free inode
+        let inode_idx = match self.allocate_inode() {
+            Some(idx) => idx,
+            None => return reply.error(Errno::ENOSPC),
+        };
+
+        // timestamp
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap();
 
-        // Hardcode inode 2 for now just to verify create is working
+        // create and store the inode
+        let new_inode = InodeAttributes {
+            inode: inode_idx,
+            size: 0,
+            kind: FileKind::File,
+            hardlinks: 1,
+            mode: 0o644,
+            uid: _req.uid(),
+            gid: _req.gid(),
+            ..Default::default()
+        };
+        self.set_inode_table(inode_idx, new_inode);
+
         let attrs = fuser::FileAttr {
-            ino: INodeNo(2),
+            ino: INodeNo(inode_idx),
             size: 0,
             blocks: 0,
             atime: std::time::UNIX_EPOCH + std::time::Duration::new(now.as_secs(), now.subsec_nanos()),
@@ -554,7 +638,7 @@ impl Filesystem for FuseFS {
             .unwrap()
             .entry(parent.0)
             .or_insert_with(Vec::new)
-            .push((2, name.to_string_lossy().to_string()));
+            .push((inode_idx, name.to_string_lossy().to_string()));
 
         info!("Created file {:?}", name);
         reply.created(
@@ -568,34 +652,118 @@ impl Filesystem for FuseFS {
     
     // read data
     fn read(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64,
-            size: u32, _flags: OpenFlags, _lock: Option<LockOwner>, reply: ReplyData) {
+        size: u32, _flags: OpenFlags, _lock: Option<LockOwner>, reply: ReplyData) {
 
+        // check inode is allocated in bitmap
         let chunk = ino.0 as usize / 1024;
         let bit = ino.0 as usize % 1024;
 
         let inode_bitmap_binding = self.inode_bitmap.read().unwrap();
-        let bitmap_chunk = match inode_bitmap_binding.get(chunk){
+        let bitmap_chunk = match inode_bitmap_binding.get(chunk) {
             Some(slot) => slot,
-            None => return reply.error(Errno::ENOENT) 
+            None => return reply.error(Errno::ENOENT),
+        };
+        if !bitmap_chunk.get(bit) {
+            return reply.error(Errno::ENOENT);
+        }
+        drop(inode_bitmap_binding);
+
+        // get inode from inode table
+        let inode_table_binding = self.inode_table.read().unwrap();
+        let inode = match inode_table_binding.get(ino.0 as usize) {
+            Some(ino) => ino,
+            None => return reply.error(Errno::ENOENT),
         };
 
-        // check if inode really exist
-        if !bitmap_chunk.get(bit) {
-            // If the bit is 0, file doesn't exist
-            reply.error(Errno::ENOENT);
-            return;
+        let block_size = self.superblock.block_size as u64;
+        let mut bytes_read_total = 0u64;
+        let mut result = vec![0u8; size as usize];
+
+        // walk extents to read data
+        let mut remaining = size as u64;
+        let mut current_offset = offset;
+
+        for (block_idx, _length) in inode.extent_index.iter() {
+            if remaining == 0 {
+                break;
+            }
+            if *block_idx == 0 {
+                continue;
+            }
+
+            let block_num = current_offset / block_size;
+            let block_offset = current_offset % block_size;
+            let bytes_to_read = remaining.min(block_size - block_offset);
+
+            let read_offset = self.offset_from_block_idx(*block_idx) + block_offset;
+            let buf_start = bytes_read_total as usize;
+            let buf_end = buf_start + bytes_to_read as usize;
+
+            match self.block_store_fd.read_at(&mut result[buf_start..buf_end], read_offset) {
+                Ok(n) => {
+                    bytes_read_total += n as u64;
+                    remaining -= n as u64;
+                    current_offset += n as u64;
+                }
+                Err(_) => return reply.error(Errno::EIO),
+            }
+
+            let _ = block_num; // suppress unused warning
         }
 
-        // calculate start location, start from superblock and jump slots
-        let file_base_address = self.superblock.data_start + (ino.0 * self.superblock.block_size as u64);
+        reply.data(&result[..bytes_read_total as usize]);
+    }
 
-        // create buffer, value starts at 0, type is u8
-        let mut buffer = vec![0u8; size as usize];
+    fn write(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64,
+         data: &[u8], _write_flags: WriteFlags, _flags: OpenFlags,
+         _lock_owner: Option<LockOwner>, reply: fuser::ReplyWrite) {
 
-        // Adding file to buffer at exact offset address, check if read is
-        // successful and return data, otherwise just return error
-        match self.block_store_fd.read_at(&mut buffer, file_base_address + offset as u64) {
-            Ok(bytes_read) => reply.data(&buffer[..bytes_read]),
+        // get the inode from the inode table
+        let mut inode_table_binding= self.inode_table.write().unwrap();
+        let inode = match inode_table_binding.get_mut(ino.0 as usize) {
+            Some(ino) => ino,
+            None => return reply.error(Errno::ENOENT),
+        };
+
+        // figure out which block the offset falls into
+        let block_size = self.superblock.block_size as u64;
+        let block_num = offset / block_size;
+        let block_offset = offset % block_size;
+
+        // check if we already have a block allocated for this position
+        let block_idx = if inode.extent_index[block_num as usize].0 != 0 {
+            // block already allocated, reuse it
+            inode.extent_index[block_num as usize].0
+        } else {
+            // allocate a new block
+            let new_block = match self.allocate_block() {
+                Some(b) => b,
+                None => return reply.error(Errno::ENOSPC),
+            };
+            inode.extent_index[block_num as usize] = (new_block, 1);
+            new_block
+        };
+
+        // calculate the byte offset into the data region
+        let write_offset = self.offset_from_block_idx(block_idx) + block_offset;
+
+        // write data to disk
+        match self.block_store_fd.write_at(data, write_offset) {
+            Ok(bytes_written) => {
+                // update inode size if needed
+                let new_size = offset + bytes_written as u64;
+                if new_size > inode.size {
+                    inode.size = new_size;
+                }
+
+                // persist inode to disk
+                if let Err(e) = self.write_inode(ino.0, inode) {
+                    error!("failed to persist inode {}: {}", ino.0, e);
+                    return reply.error(Errno::EIO);
+                }
+
+                reply.written(bytes_written as u32);
+            }
             Err(_) => reply.error(Errno::EIO),
         }
     }
@@ -1289,5 +1457,227 @@ mod tests {
 
         //attempt at allocation should return None
         assert!(fs.allocate_inode().is_none(), "should return None when all inodes are used");
+    }
+
+    #[test]
+    fn test_write_inode_persists_to_disk() {
+        let tmp = NamedTempFile::new().unwrap();
+        let fd = tmp.reopen().unwrap();
+        let fs = FuseFS::new(fd, 4096, 1024, 1024);
+
+        let inode = InodeAttributes {
+            inode: 5,
+            size: 1234,
+            kind: FileKind::File,
+            hardlinks: 1,
+            mode: 0o644,
+            ..Default::default()
+        };
+
+        fs.write_inode(5, &inode).expect("write_inode should succeed");
+
+        // Read back from disk and verify
+        let offset = fs.superblock.itable_start 
+            + (5 * size_of::<InodeAttributes>() as u64);
+        let mut buf = vec![0u8; size_of::<InodeAttributes>()];
+        fs.block_store_fd.read_at(&mut buf, offset).unwrap();
+
+        let recovered: InodeAttributes = bincode::deserialize(&buf).unwrap();
+        assert_eq!(recovered.inode, 5);
+        assert_eq!(recovered.size, 1234);
+        assert_eq!(recovered.kind, FileKind::File);
+    }
+
+    #[test]
+    fn test_read_write_inode_roundtrip() {
+        let tmp = NamedTempFile::new().unwrap();
+        let fd = tmp.reopen().unwrap();
+        let fs = FuseFS::new(fd, 4096, 1024, 1024);
+
+        let inode = InodeAttributes {
+            inode: 5,
+            size: 1234,
+            kind: FileKind::File,
+            hardlinks: 1,
+            mode: 0o644,
+            ..Default::default()
+        };
+
+        fs.write_inode(5, &inode).expect("write should succeed");
+        let recovered = fs.read_inode(5).expect("read should succeed");
+
+        assert_eq!(recovered.inode, 5);
+        assert_eq!(recovered.size, 1234);
+        assert_eq!(recovered.kind, FileKind::File);
+    }
+
+    #[test]
+    fn test_write_stores_data_to_disk() {
+        let tmp = NamedTempFile::new().unwrap();
+        let fd = tmp.reopen().unwrap();
+        let fs = FuseFS::new(fd, 4096, 1024, 1024);
+
+        // allocate an inode manually
+        let inode_idx = fs.allocate_inode().expect("should have free inodes");
+
+        let inode = InodeAttributes {
+            inode: inode_idx,
+            size: 0,
+            kind: FileKind::File,
+            hardlinks: 1,
+            mode: 0o644,
+            ..Default::default()
+        };
+        fs.set_inode_table(inode_idx, inode);
+
+        // write some data
+        let data = b"hello world";
+        let block_idx = fs.allocate_block().expect("should have free blocks");
+        let write_offset = fs.offset_from_block_idx(block_idx);
+        fs.block_store_fd.write_at(data, write_offset).expect("write should succeed");
+
+        // read it back and verify
+        let mut buf = vec![0u8; data.len()];
+        fs.block_store_fd.read_at(&mut buf, write_offset).expect("read should succeed");
+        assert_eq!(&buf, data);
+    }
+
+    #[test]
+    fn test_read_write_extent_roundtrip() {
+        let tmp = NamedTempFile::new().unwrap();
+        let fd = tmp.reopen().unwrap();
+        let fs = FuseFS::new(fd, 4096, 1024, 1024);
+
+        // allocate an inode and a block
+        let inode_idx = fs.allocate_inode().expect("should have free inodes");
+        let block_idx = fs.allocate_block().expect("should have free blocks");
+
+        // set up inode with extent pointing to the block
+        let inode = InodeAttributes {
+            inode: inode_idx,
+            size: 11,
+            kind: FileKind::File,
+            hardlinks: 1,
+            mode: 0o644,
+            extent_index: [(block_idx, 1), (0,0), (0,0), (0,0), (0,0), (0,0), (0,0), (0,0)],
+            ..Default::default()
+        };
+        fs.set_inode_table(inode_idx, inode);
+
+        // write data directly to the block
+        let data = b"hello world";
+        let write_offset = fs.offset_from_block_idx(block_idx);
+        fs.block_store_fd.write_at(data, write_offset).expect("write should succeed");
+
+        // now read it back using the extent system
+        let inode_table_binding = fs.inode_table.read().unwrap();
+        let inode = inode_table_binding.get(inode_idx as usize).unwrap();
+
+        let mut result = vec![0u8; data.len()];
+        let read_offset = fs.offset_from_block_idx(inode.extent_index[0].0);
+        fs.block_store_fd.read_at(&mut result, read_offset).expect("read should succeed");
+
+        assert_eq!(&result, data);
+    }
+
+    #[test]
+    fn test_create_allocates_unique_inodes() {
+        let tmp = NamedTempFile::new().unwrap();
+        let fd = tmp.reopen().unwrap();
+        let fs = FuseFS::new(fd, 4096, 1024, 1024);
+
+        // allocate first inode
+        let inode1 = fs.allocate_inode().expect("should have free inodes");
+        let inode2 = fs.allocate_inode().expect("should have free inodes");
+
+        // verify they are different
+        assert_ne!(inode1, inode2, "each file should get a unique inode");
+
+        // set up inodes in the inode table
+        let new_inode1 = InodeAttributes {
+            inode: inode1,
+            size: 0,
+            kind: FileKind::File,
+            hardlinks: 1,
+            mode: 0o644,
+            ..Default::default()
+        };
+        let new_inode2 = InodeAttributes {
+            inode: inode2,
+            size: 0,
+            kind: FileKind::File,
+            hardlinks: 1,
+            mode: 0o644,
+            ..Default::default()
+        };
+        fs.set_inode_table(inode1, new_inode1);
+        fs.set_inode_table(inode2, new_inode2);
+
+        // verify both inodes are in the inode table
+        let inode_table_binding = fs.inode_table.read().unwrap();
+        let stored_inode1 = inode_table_binding.get(inode1 as usize).unwrap();
+        let stored_inode2 = inode_table_binding.get(inode2 as usize).unwrap();
+
+        assert_eq!(stored_inode1.inode, inode1);
+        assert_eq!(stored_inode2.inode, inode2);
+        assert_eq!(stored_inode1.kind, FileKind::File);
+        assert_eq!(stored_inode2.kind, FileKind::File);
+
+        // verify both are added to dir_entries
+        fs.dir_entries
+            .write()
+            .unwrap()
+            .entry(1)
+            .or_insert_with(Vec::new)
+            .push((inode1, "file1.txt".to_string()));
+
+        fs.dir_entries
+            .write()
+            .unwrap()
+            .entry(1)
+            .or_insert_with(Vec::new)
+            .push((inode2, "file2.txt".to_string()));
+
+        let dir_entries_binding = fs.dir_entries.read().unwrap();
+        let entries = dir_entries_binding.get(&1).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].1, "file1.txt");
+        assert_eq!(entries[1].1, "file2.txt");
+    }
+
+    #[test]
+    fn test_lookup_finds_existing_file() {
+        let tmp = NamedTempFile::new().unwrap();
+        let fd = tmp.reopen().unwrap();
+        let fs = FuseFS::new(fd, 4096, 1024, 1024);
+
+        // allocate an inode and set it up
+        let inode_idx = fs.allocate_inode().expect("should have free inodes");
+        let new_inode = InodeAttributes {
+            inode: inode_idx,
+            size: 0,
+            kind: FileKind::File,
+            hardlinks: 1,
+            mode: 0o644,
+            ..Default::default()
+        };
+        fs.set_inode_table(inode_idx, new_inode);
+
+        // add the file to dir_entries
+        fs.dir_entries
+            .write()
+            .unwrap()
+            .entry(1)
+            .or_insert_with(Vec::new)
+            .push((inode_idx, "test.txt".to_string()));
+
+        // verify lookup finds the file
+        let found = fs.find_dir_entry(1, std::ffi::OsStr::new("test.txt"));
+        assert!(found.is_some(), "lookup should find the file");
+        assert_eq!(found.unwrap(), inode_idx);
+
+        // verify lookup returns none for a file that doesn't exist
+        let not_found = fs.find_dir_entry(1, std::ffi::OsStr::new("missing.txt"));
+        assert!(not_found.is_none(), "lookup should return none for missing file");
     }
 }
