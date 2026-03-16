@@ -500,7 +500,7 @@ impl FuseFS {
         // Read in and deserialize the entries data structure from disk
         // Loop over array of extents and collect all bytes in directory file.
         let mut dir_bytes: Vec<u8> = Vec::new();
-        debug!("current extents: {:?}", attr.extent_index);
+        // debug!("current extents: {:?}", attr.extent_index);
         for ex in &attr.extent_index {
             let read_b = match self.read_extent(ex) {
                 Ok(r) => r,
@@ -508,15 +508,21 @@ impl FuseFS {
             };
             dir_bytes.extend(read_b)
         };
+
         // NOTE: This should just be done by (de)serializing to JSON using the
         // default serde serializer. We will try to implement/add in a more
         // efficient serialization procedure later on.
         // NOTE: Use the size of the file to only read appropriate bytes.
-        println!("{}", attr.size);
+        // println!("{}", attr.size);
+        // debug!("serialized entries in bytes: {:?}", &dir_bytes[..(attr.size) as usize]);
         let entries = match serde_json::from_slice(&dir_bytes[..(attr.size as usize)]) {
             Ok(e) => e,
+            // TODO: Serialization here is not working as expected, your serde_json
+            // is not able to successfully deserialize from slice. Need to fix
+            // this, or just give up on serialization.
             Err(_) => return Err(Errno::EINVAL),
         };
+        // debug!("entries: {:?}", entries);
         // Update inode attributes (last accessed time)
         let new_attr = InodeAttributes {
             last_accessed: time_now(),
@@ -539,18 +545,22 @@ impl FuseFS {
         };
         // Serialize entries into bytes
         let mut b_entries = serde_json::to_vec(entries).unwrap();
+        // Save full size of serialized byte vector before we consume it below.
+        let full_size = b_entries.len() as u64;
+        // debug!("original entries in bytes: {:?}", b_entries);
         // NOTE: This is some cursed imperative code. But this whole project is
         // cursed now, so who cares.
         // Write pieces of serialized entries into block extents
-        debug!("original extents: {:?}", attr.extent_index);
+        // debug!("original extents: {:?}", attr.extent_index);
         for ex in &attr.extent_index {
             b_entries = match self.write_extent(ex, b_entries) {
                 Ok(remaining_b) => remaining_b,
                 Err(e) => return Err(e),
             };
+            // debug!("remaining bytes: {:?}", b_entries);
             if b_entries.len() == 0 {
                 let new_attr = InodeAttributes {
-                    size: b_entries.len() as u64,
+                    size: full_size,
                     last_modified: time_now(),
                     last_metadata_changed: time_now(),
                     ..attr
@@ -565,14 +575,25 @@ impl FuseFS {
             Some(exs) => exs,
             None => return Err(Errno::ENOSPC),
         };
+        // Write remaining data to new extents
+        // TODO: There must be some way to duplicate and simplify some of this
+        // code.
+        for ex in &new_extents {
+            b_entries = match self.write_extent(ex, b_entries) {
+                Ok(remaining_b) => remaining_b,
+                Err(e) => return Err(e),
+            };
+            // debug!("remaining bytes: {:?}", b_entries);
+            if b_entries.len() == 0 {
+                break
+            }
+        }
+        // Merge old extents with new extents and add to attributes
         let mut all_extents = attr.extent_index.clone();
         all_extents.extend(new_extents);
-        // TODO: The problem is here: we are not actually allocating extents
-        // properly. (brief update: yeah, the extent allocation code is wrong
-        // and is not properly constructing extents.)
-        debug!("all extents: {:?}", all_extents);
+        // debug!("all extents: {:?}", all_extents);
         let new_attr = InodeAttributes {
-            size: b_entries.len() as u64,
+            size: full_size,
             last_modified: time_now(),
             last_metadata_changed: time_now(),
             extent_index: all_extents,
@@ -696,7 +717,7 @@ impl Filesystem for FuseFS {
                 return;
             }
         };
-        debug!("entries: {:?}", entries);
+        // debug!("entries: {:?}", entries);
 
         for (index, entry) in entries.iter().skip(offset as usize).enumerate() {
             let (name, (inode, file_type)) = entry;
@@ -716,7 +737,6 @@ impl Filesystem for FuseFS {
     }
 
     // Look up a directory entry by name and get its attributes.
-    // TODO: I'm still getting a reading directory '.': Invalid argument error.
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: fuser::ReplyEntry) {
         // Lookup specific name in parent directory
         let inode = match self.lookup_name(parent, name) {
