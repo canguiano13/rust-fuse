@@ -1,10 +1,9 @@
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
 use std::io;
 use std::io::Error;
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
-// use std::io::prelude::*;
+use std::os::unix::ffi::OsStrExt;
 use std::io::ErrorKind;
 use std::io::BufReader;
 use std::io::BufRead;
@@ -228,7 +227,7 @@ impl Meta {
 type DirectoryEntries = BTreeMap<Vec<u8>, (u64, FileKind)>;
 
 struct FuseFS {
-    fs_dir: PathBuf,
+    // fs_dir: PathBuf,
     meta: Meta,
     meta_fd: File,
     store_fd: File,
@@ -287,7 +286,7 @@ impl FuseFS {
 
         info!("Created filesystem.");
         Ok(FuseFS {
-            fs_dir: fs_dir_path,
+            // fs_dir: fs_dir_path,
             meta,
             meta_fd,
             store_fd,
@@ -544,6 +543,7 @@ impl FuseFS {
             return Err(Errno::ENOTDIR)
         };
         // Serialize entries into bytes
+        // TODO: Fix this.
         let mut b_entries = serde_json::to_vec(entries).unwrap();
         // NOTE: This is some cursed imperative code. But this whole project is
         // cursed now, so who cares.
@@ -589,22 +589,36 @@ impl Filesystem for FuseFS {
     fn init(&mut self,
             _req: &Request,
             _config: &mut fuser::KernelConfig,
-    ) -> Result<(), io::Error> {
+    ) -> io::Result<()> {
         info!("Filesystem mounted successfully");
-        // Set up root directory as inode 0
+        // Set up root directory as inode 0. Let's see if this causes any
+        // problems --- see note below.
+        // NOTE: It looks like POSIX filesystems reserve inode 0 for other
+        // purposes, such as marking deleted directory entries. Very weird.
+        // https://utcc.utoronto.ca/~cks/space/blog/unix/POSIXAllowsZeroInode
+        // https://news.ycombinator.com/item?id=44142955
         let root_inode: u64 = 0;
+        // Allocate first inode for root
         self.meta.inode_bitmap[0].set(0, true);
         let root_inode_attr = InodeAttributes {
             inode: root_inode,
             size: 0,
             kind: FileKind::Directory,
-            mode: 0o755,
+            last_accessed: time_now(),
+            last_modified: time_now(),
+            last_metadata_changed: time_now(),
+            mode: 0o777,
             hardlinks: 2,
             uid: 0,
             gid: 0,
             ..Default::default()
         };
         self.set_inode_attr(INodeNo(root_inode), root_inode_attr);
+        let mut entries = BTreeMap::new();
+        entries.insert(b".".to_vec(), (root_inode, FileKind::Directory));
+        // Just unwrap this --- this should never return an error, and if it
+        // does, we should probably panic anyway.
+        self.write_directory(INodeNo(root_inode), &entries).unwrap();
         Ok(())
     }
 
@@ -655,28 +669,34 @@ impl Filesystem for FuseFS {
         reply.attr(&std::time::Duration::from_secs(1), &attrs);
     }
 
-    fn readdir(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64,
-               mut reply: fuser::ReplyDirectory) {
-        if ino.0 != 1 {
-            reply.error(Errno::ENOENT);
-            return;
-        }
-
-        let mut entries = vec![
-            (INodeNo(1), fuser::FileType::Directory, ".".to_string()),
-            (INodeNo(1), fuser::FileType::Directory, "..".to_string()),
-        ];
-
-        // Add any files that have been created
-        if let Some(children) = self.dir_entries.read().unwrap().get(&ino.0) {
-            for (child_ino, name) in children {
-                // TODO: Note that not all files will be RegularFiles...
-                entries.push((INodeNo(*child_ino), fuser::FileType::RegularFile, name.clone()));
+    // TODO: Get more of this stuff working. Also, implement static sizing of
+    // the backing file in new(). Also, serialization with postcard (once you
+    // test things with JSON).
+    fn readdir(&self, _req: &Request,
+               ino: INodeNo,
+               _fh: FileHandle,
+               offset: u64,
+               mut reply: fuser::ReplyDirectory
+    ) {
+        debug!("readdir() called with {ino:?}");
+        let entries = match self.read_directory(ino) {
+            Ok(entries) => entries,
+            Err(error_code) => {
+                reply.error(error_code);
+                return;
             }
-        }
+        };
 
-        for (i, (inode, kind, name)) in entries.iter().enumerate().skip(offset as usize) {
-            if reply.add(*inode, (i + 1) as u64, *kind, name) {
+        for (index, entry) in entries.iter().skip(offset as usize).enumerate() {
+            let (name, (inode, file_type)) = entry;
+            let buffer_full: bool = reply.add(
+                INodeNo(*inode),
+                offset + index as u64 + 1,
+                (*file_type).into(),
+                OsStr::from_bytes(&name[..]),
+            );
+
+            if buffer_full {
                 break;
             }
         }
