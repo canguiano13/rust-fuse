@@ -3,12 +3,15 @@
 ---- fix allocate block function
 ---- fix issues with indexing into inode table and inode allocation due to inode numbers starting at 1
 ---- set backing file size to be static
-
+---- remove all testing printouts
 ---- serialize with postcard instead of serde_json
 ---- run clippy and cargo fmt
+
 - Fix all existing, broken Filesystem implementations.
 - Add the Filesystem functions I assigned myself.
 - Add basic UID/GID ACL stuff.
+
+- a big challenge: figuring out serialization and doing conversions in code
 
 extra shit:
 - Actually serialize metadata to vec of u8s and use rkyv (or another more efficient serialization format

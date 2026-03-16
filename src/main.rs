@@ -364,6 +364,8 @@ impl FuseFS {
     // TODO: This function is not correct, need to debug. Generally, you might
     // need to rewrite this function --- the second value in an extent is the
     // size of the extent, not the ending index.
+    // UPDATE: Ok, well it's debugged for at least one test case. Might still
+    // be broken though...
     fn allocate_blocks(&self, size: usize) -> Option<Vec<Extent>> {
         // Return immediately with empty extent vector if size is 0
         if size == 0 {
@@ -579,6 +581,18 @@ impl FuseFS {
         self.set_inode_attr(inode, new_attr);
         return Ok(())
     }
+
+    fn lookup_name(&self, parent: INodeNo, name: &OsStr) -> Result<InodeAttributes, Errno> {
+        let entries = self.read_directory(parent)?;
+        let name_string = match name.to_str() {
+            Some(s) => s.to_string(),
+            None => return Err(Errno::EINVAL),
+        };
+        if let Some((inode, _)) = entries.get(&name_string) {
+            return self.get_inode_attr(INodeNo(*inode));
+        }
+        return Err(Errno::ENOENT);
+    }
 }
 
 // Implement the Filesystem trait to integrate FuseFS with fuser.
@@ -668,9 +682,6 @@ impl Filesystem for FuseFS {
         reply.attr(&std::time::Duration::from_secs(1), &attrs);
     }
 
-    // TODO: Get more of this stuff working. Also, implement static sizing of
-    // the backing file in new(). Also, serialization with postcard (once you
-    // test things with JSON).
     fn readdir(&self, _req: &Request,
                ino: INodeNo,
                _fh: FileHandle,
@@ -685,6 +696,7 @@ impl Filesystem for FuseFS {
                 return;
             }
         };
+        debug!("entries: {:?}", entries);
 
         for (index, entry) in entries.iter().skip(offset as usize).enumerate() {
             let (name, (inode, file_type)) = entry;
@@ -703,24 +715,39 @@ impl Filesystem for FuseFS {
         reply.ok();
     }
 
-    // Adding lookup, need lookup before implementing create
-    // fn lookup(&self, _req: &Request, parent: INodeNo, _name: &OsStr, reply: fuser::ReplyEntry) {
-    //     // For now only handle lookups in the root directory
-    //     if parent.0 != 1 {
-    //         reply.error(Errno::ENOENT);
-    //         return;
-    //     }
+    // Look up a directory entry by name and get its attributes.
+    // TODO: I'm still getting a reading directory '.': Invalid argument error.
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: fuser::ReplyEntry) {
+        // Lookup specific name in parent directory
+        let inode = match self.lookup_name(parent, name) {
+            Ok(a) => a,
+            Err(e) => {
+                reply.error(e);
+                return
+            }
+        };
 
-    //     // Search the inode table for a matching name, still need work
-    //     for inode in &self.inode_table {
-    //         if inode.hardlinks > 0 {
+        // Convert InodeAttributes to fuser::FileAttr
+        let attrs = fuser::FileAttr {
+            ino: parent,
+            size: inode.size,
+            blocks: inode.size.div_ceil(u64::from(self.meta.superblock.block_size as u64)),
+            atime: system_time_from_time(inode.last_accessed.0, inode.last_accessed.1),
+            mtime: system_time_from_time(inode.last_modified.0, inode.last_modified.1),
+            ctime: system_time_from_time(inode.last_metadata_changed.0, inode.last_metadata_changed.1),
+            crtime: std::time::UNIX_EPOCH,
+            kind: inode.kind.into(),
+            perm: inode.mode,
+            nlink: inode.hardlinks,
+            uid: inode.uid,
+            gid: inode.gid,
+            rdev: 0,
+            blksize: self.meta.superblock.block_size,
+            flags: 0,
+        };
 
-    //         }
-    //     }
-
-    //     // No file found
-    //     reply.error(Errno::ENOENT);
-    // }
+        reply.entry(&std::time::Duration::from_secs(1), &attrs, fuser::Generation(0));
+    }
 
     // //Adding create
     // fn create(&self, _req: &Request, parent: INodeNo, name: &OsStr,
