@@ -1,11 +1,15 @@
-- Add directory entries data structure the system, with proper serialization.
-- Implement functions for inode updates, bitmap updates, and file read/writes.
----- fix allocate block function
+- X Add directory entries data structure the system, with proper serialization.
+- X Implement functions for inode updates, bitmap updates, and file read/writes.
+
+---- finish simple version of create function
+---- add function that converts inodeattributes to fileattr in FuseFS
 ---- fix issues with indexing into inode table and inode allocation due to inode numbers starting at 1
 ---- set backing file size to be static
----- remove all testing printouts
----- serialize with postcard instead of serde_json
+---- finish implementations of write/read file and try to clean things up/simplify a bit
 ---- run clippy and cargo fmt
+
+
+---- serialize with postcard instead of serde_json
 
 - Fix all existing, broken Filesystem implementations.
 - Add the Filesystem functions I assigned myself.

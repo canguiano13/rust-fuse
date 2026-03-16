@@ -89,6 +89,31 @@ impl From<FileKind> for fuser::FileType {
     }
 }
 
+// Small helper to convert standard Linux "mode" integers into the filetypes
+// they represent, at least for the 3 filetypes we implement.
+// NOTE: Why do all these lower-level systems use all these magic numbers...we
+// should be able to pass real types around lol.
+fn as_file_kind(mut mode: u32) -> FileKind {
+    mode &= libc::S_IFMT as u32;
+
+    if mode == libc::S_IFREG as u32 {
+        return FileKind::File;
+    } else if mode == libc::S_IFLNK as u32 {
+        return FileKind::Symlink;
+    } else if mode == libc::S_IFDIR as u32 {
+        return FileKind::Directory;
+    }
+    unimplemented!("{mode}");
+}
+
+// Helper to calculate the GID of a created file under a parent directory.
+fn creation_gid(parent: &InodeAttributes, gid: u32) -> u32 {
+    if parent.mode & libc::S_ISGID as u16 != 0 {
+        return parent.gid;
+    }
+    gid
+}
+
 // Some helper functions for time.
 // =============================================================================
 fn time_now() -> (i64, u32) {
@@ -291,6 +316,13 @@ impl FuseFS {
             meta_fd,
             store_fd,
         })
+    }
+
+    // Calculate creation mode from some u32 mode (NOTE: I actually don't know
+    // what this does exactly, but it's taken from the fuser examples simple.rs
+    // program and seems to work).
+    fn creation_mode(&self, mode: u32) -> u16 {
+        (mode & !(libc::S_ISUID | libc::S_ISGID) as u32) as u16
     }
 
     // NOTE: This just panics if something goes wrong. Should be fine, since
@@ -766,58 +798,126 @@ impl Filesystem for FuseFS {
             flags: 0,
         };
 
+        // NOTE: I don't really know what the Generation(0) thing is doing.
         reply.entry(&std::time::Duration::from_secs(1), &attrs, fuser::Generation(0));
     }
 
-    // //Adding create
-    // fn create(&self, _req: &Request, parent: INodeNo, name: &OsStr,
-    //       _mode: u32, _umask: u32, _flags: i32, reply: fuser::ReplyCreate) {
+    fn create(&self,
+              req: &Request,
+              parent: INodeNo,
+              name: &OsStr,
+              mode: u32,
+              _umask: u32,
+              _flags: i32,
+              reply: fuser::ReplyCreate
+    ) {
+        debug!("create() called with {parent:?} {name:?}");
+        if self.lookup_name(parent, name).is_ok() {
+            reply.error(Errno::EEXIST);
+            return;
+        }
 
-    //     // Only support creating files in root directory for now
-    //     if parent.0 != 1 {
-    //         reply.error(Errno::ENOENT);
-    //         return;
-    //     }
+        // Allocate next free inode
+        let ino = match self.allocate_inode() {
+            Some(idx) => idx,
+            None => return reply.error(Errno::ENOSPC),
+        };
 
-    //     let now = std::time::SystemTime::now()
-    //         .duration_since(std::time::UNIX_EPOCH)
-    //         .unwrap();
+        // Update parent inode attributes
+        let mut parent_attrs = match self.get_inode_attr(parent) {
+            Ok(attrs) => attrs,
+            Err(error_code) => {
+                reply.error(error_code);
+                return;
+            }
+        };
+        parent_attrs.last_modified = time_now();
+        parent_attrs.last_metadata_changed = time_now();
 
-    //     // Hardcode inode 2 for now just to verify create is working
-    //     let attrs = fuser::FileAttr {
-    //         ino: INodeNo(2),
-    //         size: 0,
-    //         blocks: 0,
-    //         atime: std::time::UNIX_EPOCH + std::time::Duration::new(now.as_secs(), now.subsec_nanos()),
-    //         mtime: std::time::UNIX_EPOCH + std::time::Duration::new(now.as_secs(), now.subsec_nanos()),
-    //         ctime: std::time::UNIX_EPOCH + std::time::Duration::new(now.as_secs(), now.subsec_nanos()),
-    //         crtime: std::time::UNIX_EPOCH,
-    //         kind: fuser::FileType::RegularFile,
-    //         perm: 0o644,
-    //         nlink: 1,
-    //         uid: _req.uid(),
-    //         gid: _req.gid(),
-    //         rdev: 0,
-    //         blksize: self.superblock.block_size,
-    //         flags: 0,
-    //     };
+        // Create new inode attributes
+        let inode = InodeAttributes {
+            inode: ino.0,
+            open_file_handles: 1,
+            size: 0,
+            last_accessed: time_now(),
+            last_modified: time_now(),
+            last_metadata_changed: time_now(),
+            kind: as_file_kind(mode),
+            mode: self.creation_mode(mode),
+            hardlinks: 1,
+            uid: req.uid(),
+            gid: creation_gid(&parent_attrs, req.gid()),
+            extent_index: Vec::new(),
+        };
 
-    //     self.dir_entries
-    //         .write()
-    //         .unwrap()
-    //         .entry(parent.0)
-    //         .or_insert_with(Vec::new)
-    //         .push((2, name.to_string_lossy().to_string()));
+        // TODO: It really might be useful to have a conversion from InodeAttributes
+        // to FileAttrs, but this would require a restructuring of the code to
+        // do cleanly. I guess just have a helper function inside FuseFS that
+        // does the conversion without talking about impls.
+        // Generate fuser::FileAttr from InodeAttributes for reply later on
+        let attrs = fuser::FileAttr {
+            ino: parent,
+            size: inode.size,
+            blocks: inode.size.div_ceil(u64::from(self.meta.superblock.block_size as u64)),
+            atime: system_time_from_time(inode.last_accessed.0, inode.last_accessed.1),
+            mtime: system_time_from_time(inode.last_modified.0, inode.last_modified.1),
+            ctime: system_time_from_time(inode.last_metadata_changed.0, inode.last_metadata_changed.1),
+            crtime: std::time::UNIX_EPOCH,
+            kind: inode.kind.into(),
+            perm: inode.mode,
+            nlink: inode.hardlinks,
+            uid: inode.uid,
+            gid: inode.gid,
+            rdev: 0,
+            blksize: self.meta.superblock.block_size,
+            flags: 0,
+        };
 
-    //     info!("Created file {:?}", name);
-    //     reply.created(
-    //         &std::time::Duration::from_secs(1),
-    //         &attrs,
-    //         fuser::Generation(0),
-    //         fuser::FileHandle(0),
-    //         fuser::FopenFlags::empty(),
-    //     );
-    // }
+        // Add new inode to inode table
+        self.set_inode_attr(ino, inode);
+        // If directory, add . and .. files and write entries to disk.
+        if as_file_kind(mode) == FileKind::Directory {
+            let mut entries: DirectoryEntries = BTreeMap::new();
+            entries.insert(".".to_string(), (ino.0, FileKind::Directory));
+            entries.insert("..".to_string(), (parent.0, FileKind::Directory));
+            match self.write_directory(ino, &entries) {
+                Ok(()) => (),
+                Err(e) => {
+                    reply.error(e);
+                    return;
+                }
+            };
+        };
+
+        // Add the specified name to the parent directory
+        let mut parent_entries = self.read_directory(parent).unwrap();
+        let name_string = match name.to_str() {
+            Some(s) => s.to_string(),
+            None => {
+                reply.error(Errno::EINVAL);
+                return
+            },
+        };
+        parent_entries.insert(name_string, (ino.0, as_file_kind(mode)));
+        match self.write_directory(parent, &parent_entries) {
+            Ok(()) => (),
+            Err(e) => {
+                reply.error(e);
+                return;
+            }
+        };
+
+        // Return successful completion
+        info!("Created file {:?}", name);
+        reply.created(
+            &Duration::new(0, 0),
+            &attrs,
+            fuser::Generation(0),
+            // Not really doing anything with FileHandles in this implementation.
+            fuser::FileHandle(0),
+            fuser::FopenFlags::empty(),
+        );
+    }
 
     // // Adding read and write, still needs much work
     // fn read(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64,
