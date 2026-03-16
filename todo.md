@@ -1,5 +1,9 @@
 - Add directory entries data structure the system, with proper serialization.
 - Implement functions for inode updates, bitmap updates, and file read/writes.
+---- fix allocate block function
+---- fix issues with indexing into inode table and inode allocation due to inode numbers starting at 1
+---- set backing file size to be static
+
 ---- serialize with postcard instead of serde_json
 ---- run clippy and cargo fmt
 - Fix all existing, broken Filesystem implementations.

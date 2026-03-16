@@ -71,7 +71,7 @@ impl Superblock {
 type Extent = (u64, u64);
 
 // NOTE: Only support three basic kinds of files.
-#[derive(Serialize, Deserialize, Copy, Clone, PartialEq, Default)]
+#[derive(Serialize, Deserialize, Copy, Clone, PartialEq, Default, Debug)]
 enum FileKind {
     #[default]
     File,
@@ -115,7 +115,7 @@ fn time_from_system_time(system_time: &SystemTime) -> (i64, u32) {
 }
 // =============================================================================
 
-#[derive(Serialize, Deserialize, Default, Clone)]
+#[derive(Serialize, Deserialize, Default, Clone, Debug)]
 struct InodeAttributes {
     pub inode: u64,
     // Ref count of open file handles to this inode
@@ -224,7 +224,7 @@ impl Meta {
 }
 
 // A B-tree map relating file name to a tuple of (inode number, file kind).
-type DirectoryEntries = BTreeMap<Vec<u8>, (u64, FileKind)>;
+type DirectoryEntries = BTreeMap<String, (u64, FileKind)>;
 
 struct FuseFS {
     // fs_dir: PathBuf,
@@ -361,6 +361,9 @@ impl FuseFS {
     // all corresponding data bitmap bits and return the associatd extent(s).
     // Otherwise, return None.
     // NOTE (side-effect): This function may change data bitmap state.
+    // TODO: This function is not correct, need to debug. Generally, you might
+    // need to rewrite this function --- the second value in an extent is the
+    // size of the extent, not the ending index.
     fn allocate_blocks(&self, size: usize) -> Option<Vec<Extent>> {
         // Return immediately with empty extent vector if size is 0
         if size == 0 {
@@ -372,13 +375,15 @@ impl FuseFS {
         for (chunk_idx, chunk) in self.meta.data_bitmap.iter().enumerate() {
             let base_offset = chunk_idx * BITMAP_CHUNK_BITS;
             let mut ex_open: usize;
-            let mut ex_close: usize;
+            let mut ex_size: usize = 0;
             // check each bit until we find a free space
             // Assertion here should be that num_blocks_needed > 0
             ex_open = match chunk.first_false_index() {
                 Some(i) => {
                     // Decrement number of blocks needed
                     num_blocks_needed -= 1;
+                    // Add to extent size
+                    ex_size += 1;
                     i
                 },
                 None => continue,
@@ -394,56 +399,42 @@ impl FuseFS {
                 };
                 let free_size = next_filled_i - ex_open;
                 if free_size > num_blocks_needed {
+                    // TODO: You're conflating the size of the extent with the
+                    // ending index of the extent, which is causing off-by-one
+                    // problems. Need to fix this!
                     // NOTE: At this point, we know that we have found enough
                     // space for the full allocation.
-                    ex_close = ex_open + num_blocks_needed;
-                    // Do annoying type conversion to u64.
-                    let global_ex_open: u64 = match (base_offset + ex_open).try_into() {
-                        Ok(o) => o,
-                        Err(e) => panic!("{}", e),
-                    };
-                    let global_ex_close: u64 = match (base_offset + ex_close).try_into() {
-                        Ok(o) => o,
-                        Err(e) => panic!("{}", e),
-                    };
-                    extents.push((global_ex_open, global_ex_close));
+                    ex_size += num_blocks_needed;
+                    extents.push(((base_offset + ex_open) as u64, ex_size as u64));
                     // Only actually allocate/set inode bits when we definitely
                     // have enough space for the full allocation.
                     for ex in &extents {
                         let open = ex.0;
-                        let close = ex.1;
-                        // NOTE: Both open and close should be in the same
-                        // chunk, i.e. open / 1024 == close / 1024. Again, this
-                        // is an assertion that I unfortunately can't prove in
-                        // the code.
+                        let size = ex.1;
                         let mut mutable_chunk = self.meta.data_bitmap[open as usize / BITMAP_CHUNK_BITS];
                         let bit_offset_open = open as usize % BITMAP_CHUNK_BITS;
-                        let bit_offset_close = close as usize % BITMAP_CHUNK_BITS;
-                        for i in bit_offset_open..(bit_offset_close + 1) {
+                        for i in bit_offset_open..(bit_offset_open + size as usize) {
                             mutable_chunk.set(i as usize, true);
                         }
                     }
                     return Some(extents)
                 } else {
-                    ex_close = next_filled_i - 1;
+                    // Allocate next free section of blocks to our extent.
+                    ex_size += free_size;
                     // Decrease number of free blocks still needed accordingly.
                     num_blocks_needed -= free_size;
-                    // Do annoying type conversion to u64.
-                    let global_ex_open: u64 = match (base_offset + ex_open).try_into() {
-                        Ok(o) => o,
-                        Err(e) => panic!("{}", e),
-                    };
-                    let global_ex_close: u64 = match (base_offset + ex_close).try_into() {
-                        Ok(o) => o,
-                        Err(e) => panic!("{}", e),
-                    };
-                    extents.push((global_ex_open, global_ex_close));
+                    extents.push(((base_offset + ex_open) as u64, ex_size as u64));
                 }
-                ex_open = match chunk.next_false_index(ex_close) {
+                ex_open = match chunk.next_false_index(ex_open + ex_size) {
                     // If we still have free blocks left in the current chunk,
                     // set the new initial extent offset to the next free block
                     // and continue the loop in the current chunk.
-                    Some(i) => i,
+                    Some(i) => {
+                        // Reset extent size. NOTE: this code is truly horrible.
+                        ex_size = 1;
+                        num_blocks_needed -= 1;
+                        i
+                    },
                     // If we're out of free blocks in the current chunk, break
                     // out of this loop and go to the next chunk (in the outer
                     // for-loop).
@@ -507,6 +498,7 @@ impl FuseFS {
         // Read in and deserialize the entries data structure from disk
         // Loop over array of extents and collect all bytes in directory file.
         let mut dir_bytes: Vec<u8> = Vec::new();
+        debug!("current extents: {:?}", attr.extent_index);
         for ex in &attr.extent_index {
             let read_b = match self.read_extent(ex) {
                 Ok(r) => r,
@@ -518,6 +510,7 @@ impl FuseFS {
         // default serde serializer. We will try to implement/add in a more
         // efficient serialization procedure later on.
         // NOTE: Use the size of the file to only read appropriate bytes.
+        println!("{}", attr.size);
         let entries = match serde_json::from_slice(&dir_bytes[..(attr.size as usize)]) {
             Ok(e) => e,
             Err(_) => return Err(Errno::EINVAL),
@@ -543,11 +536,11 @@ impl FuseFS {
             return Err(Errno::ENOTDIR)
         };
         // Serialize entries into bytes
-        // TODO: Fix this.
         let mut b_entries = serde_json::to_vec(entries).unwrap();
         // NOTE: This is some cursed imperative code. But this whole project is
         // cursed now, so who cares.
         // Write pieces of serialized entries into block extents
+        debug!("original extents: {:?}", attr.extent_index);
         for ex in &attr.extent_index {
             b_entries = match self.write_extent(ex, b_entries) {
                 Ok(remaining_b) => remaining_b,
@@ -572,6 +565,10 @@ impl FuseFS {
         };
         let mut all_extents = attr.extent_index.clone();
         all_extents.extend(new_extents);
+        // TODO: The problem is here: we are not actually allocating extents
+        // properly. (brief update: yeah, the extent allocation code is wrong
+        // and is not properly constructing extents.)
+        debug!("all extents: {:?}", all_extents);
         let new_attr = InodeAttributes {
             size: b_entries.len() as u64,
             last_modified: time_now(),
@@ -597,11 +594,13 @@ impl Filesystem for FuseFS {
         // purposes, such as marking deleted directory entries. Very weird.
         // https://utcc.utoronto.ca/~cks/space/blog/unix/POSIXAllowsZeroInode
         // https://news.ycombinator.com/item?id=44142955
-        let root_inode: u64 = 0;
+        let root_inode: u64 = INodeNo::ROOT.0;
         // Allocate first inode for root
-        self.meta.inode_bitmap[0].set(0, true);
+        // TODO: If root is 1, this causes other problems for inode allocation above.
+        self.meta.inode_bitmap[0].set(root_inode as usize, true);
         let root_inode_attr = InodeAttributes {
             inode: root_inode,
+            open_file_handles: 0,
             size: 0,
             kind: FileKind::Directory,
             last_accessed: time_now(),
@@ -611,11 +610,11 @@ impl Filesystem for FuseFS {
             hardlinks: 2,
             uid: 0,
             gid: 0,
-            ..Default::default()
+            extent_index: Vec::new(),
         };
-        self.set_inode_attr(INodeNo(root_inode), root_inode_attr);
+        self.set_inode_attr(INodeNo::ROOT, root_inode_attr);
         let mut entries = BTreeMap::new();
-        entries.insert(b".".to_vec(), (root_inode, FileKind::Directory));
+        entries.insert(".".to_string(), (root_inode, FileKind::Directory));
         // Just unwrap this --- this should never return an error, and if it
         // does, we should probably panic anyway.
         self.write_directory(INodeNo(root_inode), &entries).unwrap();
@@ -693,7 +692,7 @@ impl Filesystem for FuseFS {
                 INodeNo(*inode),
                 offset + index as u64 + 1,
                 (*file_type).into(),
-                OsStr::from_bytes(&name[..]),
+                OsStr::new(name),
             );
 
             if buffer_full {
