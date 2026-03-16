@@ -1,9 +1,8 @@
 - X Add directory entries data structure the system, with proper serialization.
 - X Implement functions for inode updates, bitmap updates, and file read/writes.
 
----- finish simple version of create function
----- add function that converts inodeattributes to fileattr in FuseFS
----- fix issues with indexing into inode table and inode allocation due to inode numbers starting at 1
+X ---- finish simple version of create function
+X ---- fix issues with indexing into inode table and inode allocation due to inode numbers starting at 1
 ---- set backing file size to be static
 ---- finish implementations of write/read file and try to clean things up/simplify a bit
 ---- run clippy and cargo fmt

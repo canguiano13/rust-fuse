@@ -301,13 +301,15 @@ impl FuseFS {
             .write(true)
             .read(true)
             .open(meta_file_path)?;
-        // TODO: Statically allocate the maximum size for the filesystem from
-        // num_blocks * block_size.
         let store_fd = OpenOptions::new()
             .create(true)
             .write(true)
             .read(true)
             .open(store_file_path)?;
+        // Statically allocate the maximum size for the filesystem:
+        // num_blocks * block_size.
+        let max_size = num_inodes * block_size as u64;
+        store_fd.set_len(max_size)?;
 
         info!("Created filesystem.");
         Ok(FuseFS {
@@ -344,8 +346,13 @@ impl FuseFS {
     // NOTE (side-effect): This function may change inode bitmap state.
     fn allocate_inode(&self) -> Option<INodeNo> {
         for (chunk_idx, chunk) in self.meta.inode_bitmap.iter().enumerate() {
-            // check each bit until we find a free space
-            match chunk.first_false_index() {
+            // check each bit until we find a free space, skipping index 0
+            // NOTE: inode 0 is just not allowed in Linux filesystems it seems,
+            // so avoid ever allocating it and just keep it false/empty in the
+            // bitmap. inode 1 is reserved as the root inode. This should not
+            // be a problem in practice because it is allocated on init and
+            // never deallocated, but we also skip it here for completeness.
+            match chunk.next_false_index(1) {
                 Some(i) => {
                     // Get mutable chunk here
                     let mut mutable_chunk = self.meta.inode_bitmap[chunk_idx];
@@ -393,11 +400,6 @@ impl FuseFS {
     // all corresponding data bitmap bits and return the associatd extent(s).
     // Otherwise, return None.
     // NOTE (side-effect): This function may change data bitmap state.
-    // TODO: This function is not correct, need to debug. Generally, you might
-    // need to rewrite this function --- the second value in an extent is the
-    // size of the extent, not the ending index.
-    // UPDATE: Ok, well it's debugged for at least one test case. Might still
-    // be broken though...
     fn allocate_blocks(&self, size: usize) -> Option<Vec<Extent>> {
         // Return immediately with empty extent vector if size is 0
         if size == 0 {
@@ -433,9 +435,6 @@ impl FuseFS {
                 };
                 let free_size = next_filled_i - ex_open;
                 if free_size > num_blocks_needed {
-                    // TODO: You're conflating the size of the extent with the
-                    // ending index of the extent, which is causing off-by-one
-                    // problems. Need to fix this!
                     // NOTE: At this point, we know that we have found enough
                     // space for the full allocation.
                     ex_size += num_blocks_needed;
@@ -508,8 +507,6 @@ impl FuseFS {
         }
     }
 
-    // TODO: Generally, we should be able to dynamically increase file sizes
-    // when needed, ideally by extending the last extent in the file.
     // NOTE: None of this stuff is thread-safe (for now). Concurrent writes to
     // a file are possible, and data may be corrupted.
     // fn write_file(&self, inode_attr: InodeAttributes, data: &Vec<u8>, offset: u64) -> Result<u64, Errno> {
@@ -850,10 +847,11 @@ impl Filesystem for FuseFS {
             extent_index: Vec::new(),
         };
 
-        // TODO: It really might be useful to have a conversion from InodeAttributes
+        // NOTE: It really might be useful to have a conversion from InodeAttributes
         // to FileAttrs, but this would require a restructuring of the code to
-        // do cleanly. I guess just have a helper function inside FuseFS that
-        // does the conversion without talking about impls.
+        // do cleanly. I guess we could have a helper function inside FuseFS that
+        // does the conversion without talking about impls, but that's TODO.
+
         // Generate fuser::FileAttr from InodeAttributes for reply later on
         let attrs = fuser::FileAttr {
             ino: parent,
@@ -875,7 +873,8 @@ impl Filesystem for FuseFS {
 
         // Add new inode to inode table
         self.set_inode_attr(ino, inode);
-        // If directory, add . and .. files and write entries to disk.
+
+        // If new inode is directory, add . and .. and write entries to disk.
         if as_file_kind(mode) == FileKind::Directory {
             let mut entries: DirectoryEntries = BTreeMap::new();
             entries.insert(".".to_string(), (ino.0, FileKind::Directory));
