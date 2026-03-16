@@ -277,6 +277,8 @@ impl FuseFS {
             .write(true)
             .read(true)
             .open(meta_file_path)?;
+        // TODO: Statically allocate the maximum size for the filesystem from
+        // num_blocks * block_size.
         let store_fd = OpenOptions::new()
             .create(true)
             .write(true)
@@ -337,9 +339,23 @@ impl FuseFS {
         self.meta.inode_table.write().unwrap()[inode.0 as usize] = attr;
     }
 
-    fn get_inode_attr(&self, inode: INodeNo) -> InodeAttributes {
+    fn get_inode_attr(&self, inode: INodeNo) -> Result<InodeAttributes, Errno> {
+        let chunk = inode.0 as usize / BITMAP_CHUNK_BITS;
+        let bit = inode.0 as usize % BITMAP_CHUNK_BITS;
+        // Check if inode is actually allocated in the bitmap
+        match self.meta.inode_bitmap.get(chunk) {
+            None => {
+                return Err(Errno::ENOENT)
+            }
+            Some(bitmap) => {
+                if !bitmap.get(bit) {
+                    return Err(Errno::ENOENT);
+                }
+            }
+        }
+        // If it is, get inode attributes from the inode table
         let itable = self.meta.inode_table.read().unwrap();
-        itable[inode.0 as usize].clone()
+        Ok(itable[inode.0 as usize].clone())
     }
 
     // If space is available of the desired size, allocate that space by setting
@@ -347,6 +363,10 @@ impl FuseFS {
     // Otherwise, return None.
     // NOTE (side-effect): This function may change data bitmap state.
     fn allocate_blocks(&self, size: usize) -> Option<Vec<Extent>> {
+        // Return immediately with empty extent vector if size is 0
+        if size == 0 {
+            return Some(vec![])
+        };
         let mut num_blocks_needed = size / (self.meta.superblock.block_size as usize) + 1;
         let mut extents: Vec<Extent> = Vec::new();
         // Find list of extents with total desired size
@@ -440,32 +460,47 @@ impl FuseFS {
     }
 
     fn read_extent(&self, ex: &Extent) -> Result<Vec<u8>, Errno> {
-        // TODO: Use read_at()
-        let start_byte = ex.0 as usize * self.meta.superblock.block_size as usize;
-        let extent_size_bytes = ex.1 as usize * self.meta.superblock.block_size as usize;
-        // Read specified chunk of file
+        let start_byte = ex.0 * self.meta.superblock.block_size as u64;
+        let extent_size_bytes = ex.1 * self.meta.superblock.block_size as u64;
+        // Read specified chunk of file using read_at
+        // NOTE: read_at is specific to Unix systems, so this means, of course,
+        // that our implementation will only work on Unix systems.
+        let mut buf: Vec<u8> = vec![0u8; extent_size_bytes as usize];
+        let _read_bytes = self.store_fd.read_at(&mut buf, start_byte)?;
         Ok(buf)
     }
 
-    fn write_extent(&self, ex: &Extent, data: Vec<u8>) {
-
+    fn write_extent(&self, ex: &Extent, data: Vec<u8>) -> Result<Vec<u8>, Errno> {
+        let start_byte = ex.0 * self.meta.superblock.block_size as u64;
+        let extent_size_bytes = ex.1 * self.meta.superblock.block_size as u64;
+        self.store_fd.write_at(&data[..], start_byte)?;
+        // If there are more bytes in the data byte vector, return the remaining
+        // bytes for further processing. Otherwise, we've written all of our data
+        // and we return an empty byte vector signaling completion.
+        if data.len() > extent_size_bytes as usize {
+            Ok(data[extent_size_bytes as usize..].to_vec())
+        } else {
+            Ok(vec![])
+        }
     }
 
     // TODO: Generally, we should be able to dynamically increase file sizes
     // when needed, ideally by extending the last extent in the file.
     // NOTE: None of this stuff is thread-safe (for now). Concurrent writes to
     // a file are possible, and data may be corrupted.
-    fn write_file(&self, inode_attr: InodeAttributes, data: &Vec<u8>, offset: u64) -> Result<u64, Errno> {
+    // fn write_file(&self, inode_attr: InodeAttributes, data: &Vec<u8>, offset: u64) -> Result<u64, Errno> {
 
-    }
+    // }
 
-    fn read_file(&self, inode_attr: InodeAttributes, offset: u64, size: u64) -> Result<Vec<u8>, Errno> {}
+    // fn read_file(&self, inode_attr: InodeAttributes, offset: u64, size: u64) -> Result<Vec<u8>, Errno> {}
 
 
     fn read_directory(&self, inode: INodeNo) -> Result<DirectoryEntries, Errno> {
-        // TODO: Move this stuff into the actual implementation below (i.e readdir)?
         // Get inode attributes from inode table
-        let attr = self.get_inode_attr(inode);
+        let attr = match self.get_inode_attr(inode) {
+            Ok(i) => i,
+            Err(e) => return Err(e),
+        };
         // Check that inode is actually a directory
         if attr.kind != FileKind::Directory {
             return Err(Errno::ENOTDIR)
@@ -500,58 +535,48 @@ impl FuseFS {
     // Completely replace existing directory entries with new entries.
     fn write_directory(&self, inode: INodeNo, entries: &DirectoryEntries) -> Result<(), Errno> {
         // Get inode attributes from inode table
-        let attr = self.get_inode_attr(inode);
+        let attr = match self.get_inode_attr(inode) {
+            Ok(i) => i,
+            Err(e) => return Err(e),
+        };
         // Check that inode is actually a directory
         if attr.kind != FileKind::Directory {
             return Err(Errno::ENOTDIR)
         };
         // Serialize entries into bytes
-        let b_entries = serde_json::to_vec(entries).unwrap();
+        let mut b_entries = serde_json::to_vec(entries).unwrap();
         // NOTE: This is some cursed imperative code. But this whole project is
         // cursed now, so who cares.
-        let mut start_byte = 0;
-        let mut end_byte = 0;
         // Write pieces of serialized entries into block extents
         for ex in &attr.extent_index {
-            // TODO: Check to see that you're actually doing all these conversions properly.
-            let ex_length = ex.1 as usize * self.meta.superblock.block_size as usize;
-            end_byte = start_byte + ex_length;
-            if end_byte < b_entries.len() {
-                self.write_extent(ex, b_entries[start_byte..(start_byte + ex_length)].to_vec());
-                start_byte = end_byte;
-            } else {
-                self.write_extent(ex, b_entries[start_byte..].to_vec());
-                break
-            }
-        };
-        // If we enter this if-statement, we haven't finished writing all our data.
-        let mut extents = attr.extent_index.clone();
-        if end_byte < b_entries.len() {
-            // Allocate new extents for remaining data
-            let remaining_size = b_entries.len() - end_byte;
-            let new_extents = match self.allocate_blocks(remaining_size) {
-                Some(exs) => exs,
-                None => return Err(Errno::ENOSPC)
+            b_entries = match self.write_extent(ex, b_entries) {
+                Ok(remaining_b) => remaining_b,
+                Err(e) => return Err(e),
             };
-            extents.extend(new_extents.clone());
-            for ex in &new_extents {
-                let ex_length = ex.1 as usize * self.meta.superblock.block_size as usize;
-                end_byte = start_byte + ex_length;
-                if end_byte < b_entries.len() {
-                    self.write_extent(ex, b_entries[start_byte..(start_byte + ex_length)].to_vec());
-                    start_byte = end_byte;
-                } else {
-                    self.write_extent(ex, b_entries[start_byte..].to_vec());
-                    break
-                }
+            if b_entries.len() == 0 {
+                let new_attr = InodeAttributes {
+                    size: b_entries.len() as u64,
+                    last_modified: time_now(),
+                    last_metadata_changed: time_now(),
+                    ..attr
+                };
+                self.set_inode_attr(inode, new_attr);
+                return Ok(())
             }
         }
-        // Update inode attributes
+        // If we get here, there must be more bytes to write and we need to
+        // add some more extents
+        let new_extents = match self.allocate_blocks(b_entries.len()) {
+            Some(exs) => exs,
+            None => return Err(Errno::ENOSPC),
+        };
+        let mut all_extents = attr.extent_index.clone();
+        all_extents.extend(new_extents);
         let new_attr = InodeAttributes {
             size: b_entries.len() as u64,
             last_modified: time_now(),
             last_metadata_changed: time_now(),
-            extent_index: extents,
+            extent_index: all_extents,
             ..attr
         };
         self.set_inode_attr(inode, new_attr);
@@ -600,23 +625,14 @@ impl Filesystem for FuseFS {
                _fh: Option<FileHandle>,
                reply: fuser::ReplyAttr,
     ) {
-        let chunk = ino.0 as usize / 1024;
-        let bit = ino.0 as usize % 1024;
-        // Check if inode is actually allocated in the bitmap
-        match self.meta.inode_bitmap.get(chunk) {
-            None => {
-                reply.error(Errno::ENOENT);
+        // Look up the inode attributes in the inode table
+        let inode = match self.get_inode_attr(ino) {
+            Ok(i) => i,
+            Err(e) => {
+                reply.error(e);
                 return;
             }
-            Some(bitmap) => {
-                if !bitmap.get(bit) {
-                    reply.error(Errno::ENOENT);
-                    return;
-                }
-            }
-        }
-        // Look up the inode attributes in the inode table
-        let inode = &self.meta.inode_table[ino.0 as usize];
+        };
         // Convert InodeAttributes to fuser::FileAttr
         let attrs = fuser::FileAttr {
             ino,

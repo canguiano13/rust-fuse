@@ -1,5 +1,6 @@
 - Add directory entries data structure the system, with proper serialization.
 - Implement functions for inode updates, bitmap updates, and file read/writes.
+---- serialize with postcard instead of serde_json
 ---- run clippy and cargo fmt
 - Fix all existing, broken Filesystem implementations.
 - Add the Filesystem functions I assigned myself.
