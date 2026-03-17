@@ -565,36 +565,79 @@ impl FuseFS {
             return Err(Errno::EINVAL)
         };
         // Compute mapping of offset and size to specific slices of file extents
-        let mut data_bytes: Vec<u8> = Vec::new();
         // Compute index of block (within the file) that the offset starts in
-        let offset_block_in_file = offset / self.meta.superblock.block_size as u64;
+        let mut remaining_blocks_to_offset = offset / self.meta.superblock.block_size as u64;
         // Compute byte index in the block (calculated above) that the offset starts at
-        let offset_byte_in_block = offset % self.meta.superblock.block_size as u64;
-        // Initialize counter for remaining bytes to read
-        let mut remaining_bytes = size;
-        let mut blocks_traversed = 0;
+        let byte_in_offset_block = offset % self.meta.superblock.block_size as u64;
+        // let mut byte_in_end_block;
+        let mut data_bytes: Vec<u8> = Vec::new();
+        let mut remaining_bytes = size as u64;
+        // Loop through extents and read slices from extents that are in the
+        // section of the file to be read
         for ex in &attr.extent_index {
-            // Check size (i.e. number of blocks) in extent to see if offset
-            // lies in this extent
-            blocks_traversed += ex.1;
-            if blocks_traversed > offset_block_in_file {
-                // In this case, the offset does lie in this extent and we can
-                // start reading
-                // TODO
-                // let ex
+            // TODO: There might be an off-by-one error here, so watch out.
+            // Ideally write some tests for this, but time may not allow.
+            let ex_size = ex.1;
+            if remaining_blocks_to_offset != 0 && ex_size > remaining_blocks_to_offset {
+                // In this case, we know that our offset is in this extent
+                let offset_block_i = ex.0 + remaining_blocks_to_offset;
+                let offset_byte_i =
+                    offset_block_i * self.meta.superblock.block_size as u64
+                    + byte_in_offset_block;
+                let bytes_left_in_extent =
+                    (ex_size - remaining_blocks_to_offset) * self.meta.superblock.block_size as u64
+                    - byte_in_offset_block;
+                if bytes_left_in_extent >= remaining_bytes {
+                    // We can complete the read in this extent
+                    let mut buf = vec![0u8; remaining_bytes as usize];
+                    self.store_fd.read_at(&mut buf, offset_byte_i);
+                    data_bytes.extend(&buf);
+                    break
+                } else {
+                    let mut buf = vec![0u8; bytes_left_in_extent as usize];
+                    self.store_fd.read_at(&mut buf, offset_byte_i);
+                    data_bytes.extend(&buf);
+                    // Decrease remaining bytes
+                    remaining_bytes -= bytes_left_in_extent;
+                    // And then continue the loop over extents
+                }
+            } else if remaining_blocks_to_offset != 0 {
+                // In this case, we've already passed the offset block and are
+                // on our way in the section to be read
+                let ex_start_byte_i = ex.0 * self.meta.superblock.block_size as u64;
+                let bytes_in_extent = ex_size * self.meta.superblock.block_size as u64;
+                if bytes_in_extent >= remaining_bytes {
+                    // We can complete the read in this extent
+                    let mut buf = vec![0u8; remaining_bytes as usize];
+                    self.store_fd.read_at(&mut buf, ex_start_byte_i);
+                    data_bytes.extend(&buf);
+                    break
+                } else {
+                    let mut buf = vec![0u8; bytes_in_extent as usize];
+                    self.store_fd.read_at(&mut buf, ex_start_byte_i);
+                    data_bytes.extend(&buf);
+                    // Decrease remaining bytes
+                    remaining_bytes -= bytes_in_extent;
+                    // And then continue the loop over extents
+                }
             } else {
-                // In this case, the offset does not lie in this extent and we
-                // should continue looking
-                continue
+                // In this case, we haven't yet found the offset block and we
+                // need to continue looking for it before we can start reading
+                // NOTE: At this point, we know that ex_size <= remaining_blocks_to_offset
+                // so we can mark this extent as covered --- decreasing the
+                // remaining blocks counter by its size (in blocks) --- and
+                // continuing with the loop.
+                remaining_blocks_to_offset -= ex_size;
             }
-            // let ex_size_bytes = ex.1 * self.meta.superblock.block_size as u64;
-            // if remaining_bytes as u64 > ex_size_bytes {
-            // } else {
-
-            // }
         };
-        // Collect bytes from the specific slices that the read corresponds to
         // Update metadata and return
+        // Update inode attributes (last accessed time)
+        let new_attr = InodeAttributes {
+            last_accessed: time_now(),
+            ..attr
+        };
+        self.set_inode_attr(inode, new_attr);
+        Ok(data_bytes)
 
     }
 

@@ -7,6 +7,7 @@ X ---- set backing file size to be static
 X ---- fix problem with mutability of bitmaps (i think this is done?)
 X ---- make sure that create actually works without an input/output error
 ---- finish implementations of write/read file and try to clean things up/simplify a bit
+---- finish Filesystem implementation of read/write and test
 ---- run clippy and cargo fmt
 
 ---- serialize with postcard instead of serde_json
