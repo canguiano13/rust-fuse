@@ -542,6 +542,11 @@ impl FuseFS {
     // NOTE: None of this stuff is thread-safe (for now). Concurrent writes to
     // a file are possible, and data may be corrupted.
     fn write_file(&self, inode: INodeNo, data: &Vec<u8>, offset: u64) -> Result<u64, Errno> {
+        // Get inode attributes from inode table
+        let attr = match self.get_inode_attr(inode) {
+            Ok(i) => i,
+            Err(e) => return Err(e),
+        };
         // Disallow the write if the offset is beyond the size of the file
         // Compute mapping of offset and size of the data to specific slices
         // file extents; we may need to add extents to the file.
@@ -555,13 +560,43 @@ impl FuseFS {
             Ok(i) => i,
             Err(e) => return Err(e),
         };
-        // Compute mapping of offset and size to specific slices of file extents
         // Check if the read will go beyond the size of the file
+        if offset + size as u64 > attr.size {
+            return Err(Errno::EINVAL)
+        };
+        // Compute mapping of offset and size to specific slices of file extents
+        let mut data_bytes: Vec<u8> = Vec::new();
+        // Compute index of block (within the file) that the offset starts in
+        let offset_block_in_file = offset / self.meta.superblock.block_size as u64;
+        // Compute byte index in the block (calculated above) that the offset starts at
+        let offset_byte_in_block = offset % self.meta.superblock.block_size as u64;
+        // Initialize counter for remaining bytes to read
+        let mut remaining_bytes = size;
+        let mut blocks_traversed = 0;
+        for ex in &attr.extent_index {
+            // Check size (i.e. number of blocks) in extent to see if offset
+            // lies in this extent
+            blocks_traversed += ex.1;
+            if blocks_traversed > offset_block_in_file {
+                // In this case, the offset does lie in this extent and we can
+                // start reading
+                // TODO
+                // let ex
+            } else {
+                // In this case, the offset does not lie in this extent and we
+                // should continue looking
+                continue
+            }
+            // let ex_size_bytes = ex.1 * self.meta.superblock.block_size as u64;
+            // if remaining_bytes as u64 > ex_size_bytes {
+            // } else {
+
+            // }
+        };
         // Collect bytes from the specific slices that the read corresponds to
         // Update metadata and return
 
     }
-
 
     fn read_directory(&self, inode: INodeNo) -> Result<DirectoryEntries, Errno> {
         // Get inode attributes from inode table
@@ -1069,6 +1104,81 @@ impl Filesystem for FuseFS {
     //         }
     //         Err(_) => reply.error(Errno::EIO),
     //     }
+    // }
+
+    // TODO: Paste in simple.rs mkdir for reference.
+    // fn mkdir(
+    //     &self,
+    //     _req: &Request,
+    //     parent: INodeNo,
+    //     name: &OsStr,
+    //     mut mode: u32,
+    //     _umask: u32,
+    //     reply: ReplyEntry,
+    // ) {
+    //     debug!("mkdir() called with {parent:?} {name:?} {mode:o}");
+    //     if self.lookup_name(parent, name).is_ok() {
+    //         reply.error(Errno::EEXIST);
+    //         return;
+    //     }
+
+    //     let mut parent_attrs = match self.get_inode(parent) {
+    //         Ok(attrs) => attrs,
+    //         Err(error_code) => {
+    //             reply.error(error_code);
+    //             return;
+    //         }
+    //     };
+
+    //     if !check_access(
+    //         parent_attrs.uid,
+    //         parent_attrs.gid,
+    //         parent_attrs.mode,
+    //         _req.uid(),
+    //         _req.gid(),
+    //         AccessFlags::W_OK,
+    //     ) {
+    //         reply.error(Errno::EACCES);
+    //         return;
+    //     }
+    //     parent_attrs.last_modified = time_now();
+    //     parent_attrs.last_metadata_changed = time_now();
+    //     self.write_inode(&parent_attrs);
+
+    //     if _req.uid() != 0 {
+    //         mode &= !(libc::S_ISUID | libc::S_ISGID) as u32;
+    //     }
+    //     if parent_attrs.mode & libc::S_ISGID as u16 != 0 {
+    //         mode |= libc::S_ISGID as u32;
+    //     }
+
+    //     let inode = self.allocate_next_inode();
+    //     let attrs = InodeAttributes {
+    //         inode: inode.0,
+    //         open_file_handles: 0,
+    //         size: u64::from(BLOCK_SIZE),
+    //         last_accessed: time_now(),
+    //         last_modified: time_now(),
+    //         last_metadata_changed: time_now(),
+    //         kind: FileKind::Directory,
+    //         mode: self.creation_mode(mode),
+    //         hardlinks: 2, // Directories start with link count of 2, since they have a self link
+    //         uid: _req.uid(),
+    //         gid: creation_gid(&parent_attrs, _req.gid()),
+    //         xattrs: BTreeMap::default(),
+    //     };
+    //     self.write_inode(&attrs);
+
+    //     let mut entries = BTreeMap::new();
+    //     entries.insert(b".".to_vec(), (inode.0, FileKind::Directory));
+    //     entries.insert(b"..".to_vec(), (parent.0, FileKind::Directory));
+    //     self.write_directory_content(inode, &entries);
+
+    //     let mut entries = self.get_directory_content(parent).unwrap();
+    //     entries.insert(name.as_bytes().to_vec(), (inode.0, FileKind::Directory));
+    //     self.write_directory_content(parent, &entries);
+
+    //     reply.entry(&Duration::new(0, 0), &attrs.into(), fuser::Generation(0));
     // }
 
 }
