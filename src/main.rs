@@ -748,25 +748,37 @@ impl Filesystem for FuseFS {
         reply.attr(&std::time::Duration::from_secs(1), &attrs);
     }
 
-    // fn setattr(
-    //     &self,
-    //     _req: &Request,
-    //     ino: INodeNo,
-    //     mode: Option<u32>,
-    //     uid: Option<u32>,
-    //     gid: Option<u32>,
-    //     size: Option<u64>,
-    //     _atime: Option<TimeOrNow>,
-    //     _mtime: Option<TimeOrNow>,
-    //     _ctime: Option<SystemTime>,
-    //     fh: Option<FileHandle>,
-    //     _crtime: Option<SystemTime>,
-    //     _chgtime: Option<SystemTime>,
-    //     _bkuptime: Option<SystemTime>,
-    //     _flags: Option<fuser::BsdFileFlags>,
-    //     reply: fuser::ReplyAttr,
-    // ) {
-    // }
+    fn setattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        _atime: Option<TimeOrNow>,
+        _mtime: Option<TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        fh: Option<FileHandle>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<fuser::BsdFileFlags>,
+        reply: fuser::ReplyAttr,
+    ) {
+        // NOTE: What if we just made this a noop for now?
+        let inode = match self.get_inode_attr(ino) {
+            Ok(i) => i,
+            Err(e) => {
+                reply.error(e);
+                return;
+            }
+        };
+        let attrs = self.inode_attr_to_file_attr(&inode);
+        reply.attr(&Duration::from_secs(1), &attrs)
+        // TODO: Consider actually implementing some of this stuff, i.e. for
+        // chmod, chown, and whatever else uses this function.
+    }
 
     fn readdir(&self, _req: &Request,
                ino: INodeNo,
@@ -913,25 +925,6 @@ impl Filesystem for FuseFS {
             }
         };
         debug!("new parent entries {:?}", parent_entries);
-
-        // let tt = time_now();
-        // let attrs = fuser::FileAttr {
-        //     ino,
-        //     size: 0,
-        //     blocks: 0,
-        //     atime: system_time_from_time(tt.0, tt.1),
-        //     mtime: system_time_from_time(tt.0, tt.1),
-        //     ctime: system_time_from_time(tt.0, tt.1),
-        //     crtime: std::time::UNIX_EPOCH,
-        //     kind: fuser::FileType::RegularFile,
-        //     perm: 0o644,
-        //     nlink: 1,
-        //     uid: req.uid(),
-        //     gid: req.gid(),
-        //     rdev: 0,
-        //     blksize: self.meta.superblock.block_size,
-        //     flags: 0,
-        // };
 
         // Return successful completion
         info!("Created file {:?} with {ino:?}", name);
