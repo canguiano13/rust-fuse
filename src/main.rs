@@ -547,11 +547,140 @@ impl FuseFS {
             Ok(i) => i,
             Err(e) => return Err(e),
         };
+
         // Disallow the write if the offset is beyond the size of the file
+        if offset > attr.size {
+            return Err(Errno::EINVAL)
+        };
+
+        // Compute mapping of offset and size to specific slices of file extents
+        // Compute index of block (within the file) that the offset starts in
+        let mut remaining_blocks_to_offset = offset / self.meta.superblock.block_size as u64;
+        // Compute byte index in the block (calculated above) that the offset starts at
+        let byte_in_offset_block = offset % self.meta.superblock.block_size as u64;
+        let mut bytes_written = 0;
         // Compute mapping of offset and size of the data to specific slices
         // file extents; we may need to add extents to the file.
         // Write data to the slices of the extents
+        // TODO: Update metadata in this loop before returning something.
+        // TODO: Do we really need to clone here? Figure this out next, seems
+        // extremely wasteful to do this.
+        let mut remaining_bytes_to_write = data.clone();
+        for ex in &attr.extent_index {
+            // TODO: There might be an off-by-one error here, so watch out.
+            // Ideally write some tests for this, but time may not allow.
+            let ex_size = ex.1;
+            if remaining_blocks_to_offset != 0 && ex_size > remaining_blocks_to_offset {
+                // In this case, we know that our offset is in this extent
+                let offset_block_i = ex.0 + remaining_blocks_to_offset;
+                let offset_byte_i =
+                    offset_block_i * self.meta.superblock.block_size as u64
+                    + byte_in_offset_block;
+                let bytes_left_in_extent =
+                    (ex_size - remaining_blocks_to_offset) * self.meta.superblock.block_size as u64
+                    - byte_in_offset_block;
+                // Set remaining blocks until offset to 0, since we've now found
+                // the offset block
+                remaining_blocks_to_offset = 0;
+                // Check if we can complete the write in this extent
+                if bytes_left_in_extent >= remaining_bytes_to_write.len() as u64 {
+                    // We can complete the write in this extent
+                    self.store_fd.write_at(&mut remaining_bytes_to_write[..], offset_byte_i);
+                    remaining_bytes_to_write = remaining_bytes_to_write[bytes_left_in_extent as usize..].to_vec();
+                    // Increase number of bytes written and break from loop
+                    bytes_written += remaining_bytes_to_write.len();
+                    break
+                } else {
+                    // Cannot complete write in this extent
+                    self.store_fd.write_at(
+                        &mut remaining_bytes_to_write[..bytes_left_in_extent as usize],
+                        offset_byte_i);
+                    // NOTE: What is this conversion hack...why do I need to the to_vec()?
+                    // I presume I'm not understanding something about slices vs. vectors.
+                    remaining_bytes_to_write = &remaining_bytes_to_write[bytes_left_in_extent as usize..].to_vec();
+                    // Increase number of bytes written
+                    bytes_written += bytes_left_in_extent as usize;
+                    // And then continue the loop over extents
+                }
+            } else if remaining_blocks_to_offset != 0 {
+                // In this case, we've already passed the offset block and are
+                // in the write section
+                let ex_start_byte_i = ex.0 * self.meta.superblock.block_size as u64;
+                let bytes_in_extent = ex_size * self.meta.superblock.block_size as u64;
+                if bytes_in_extent >= remaining_bytes_to_write.len() as u64 {
+                    // We can complete the write in this extent
+                    self.store_fd.write_at(&mut remaining_bytes_to_write[..], ex_start_byte_i);
+                    remaining_bytes_to_write = &remaining_bytes_to_write[bytes_in_extent as usize..].to_vec();
+                    // Increase number of bytes written and break from loop
+                    bytes_written += remaining_bytes_to_write.len();
+                    break
+                } else {
+                    // Cannot complete write in this extent
+                    self.store_fd.write_at(
+                        &mut remaining_bytes_to_write[..bytes_in_extent as usize],
+                        ex_start_byte_i);
+                    remaining_bytes_to_write = &remaining_bytes_to_write[bytes_in_extent as usize..].to_vec();
+                    // Increase number of bytes written
+                    bytes_written += bytes_in_extent as usize;
+                    // And then continue the loop over extents
+                }
+            } else {
+                // In this case, we haven't yet found the offset block and we
+                // need to continue looking for it before we can start reading
+                // NOTE: At this point, we know that ex_size <= remaining_blocks_to_offset
+                // so we can mark this extent as covered --- decreasing the
+                // remaining blocks counter by its size (in blocks) --- and
+                // continuing with the loop.
+                remaining_blocks_to_offset -= ex_size;
+            }
+        };
+        if remaining_bytes_to_write.len() == 0 {
+            // TODO: Should we return bytes written here or just return () like write_dir?
+            return Ok(bytes_written as u64)
+        };
+        // If we still have bytes to write, we'll need to add more extents
+        let extra_bytes_needed = remaining_bytes_to_write.len();
+        let new_extents = match self.allocate_blocks(extra_bytes_needed) {
+            Some(exs) => exs,
+            None => return Err(Errno::ENOSPC),
+        };
+        for ex in &new_extents {
+            // NOTE: This is the same code as in the second if-block earlier.
+            let ex_size = ex.1;
+            let ex_start_byte_i = ex.0 * self.meta.superblock.block_size as u64;
+            let bytes_in_extent = ex_size * self.meta.superblock.block_size as u64;
+            if bytes_in_extent >= remaining_bytes_to_write.len() as u64 {
+                // We can complete the write in this extent
+                self.store_fd.write_at(&mut remaining_bytes_to_write[..], ex_start_byte_i);
+                remaining_bytes_to_write = &remaining_bytes_to_write[bytes_in_extent as usize..].to_vec();
+                // Increase number of bytes written and break from loop
+                bytes_written += remaining_bytes_to_write.len();
+                break
+            } else {
+                // Cannot complete write in this extent
+                self.store_fd.write_at(
+                    &mut remaining_bytes_to_write[..bytes_in_extent as usize],
+                    ex_start_byte_i);
+                remaining_bytes_to_write = &remaining_bytes_to_write[bytes_in_extent as usize..].to_vec();
+                // Increase number of bytes written
+                bytes_written += bytes_in_extent as usize;
+                // And then continue the loop over extents
+            }
+        }
+        // Merge old extents with new extents and add to attributes
+        let mut all_extents = attr.extent_index.clone();
+        all_extents.extend(new_extents);
+
         // Update metadata and return
+        let new_attr = InodeAttributes {
+            size: attr.size + extra_bytes_needed as u64,
+            last_modified: time_now(),
+            last_metadata_changed: time_now(),
+            extent_index: all_extents,
+            ..attr
+        };
+        self.set_inode_attr(inode, new_attr);
+        return Ok(bytes_written as u64)
     }
 
     fn read_file(&self, inode: INodeNo, offset: u64, size: u32) -> Result<Vec<u8>, Errno> {
@@ -564,12 +693,14 @@ impl FuseFS {
         if offset + size as u64 > attr.size {
             return Err(Errno::EINVAL)
         };
+
         // Compute mapping of offset and size to specific slices of file extents
         // Compute index of block (within the file) that the offset starts in
         let mut remaining_blocks_to_offset = offset / self.meta.superblock.block_size as u64;
         // Compute byte index in the block (calculated above) that the offset starts at
         let byte_in_offset_block = offset % self.meta.superblock.block_size as u64;
-        // let mut byte_in_end_block;
+
+        // Store and track read data bytes
         let mut data_bytes: Vec<u8> = Vec::new();
         let mut remaining_bytes = size as u64;
         // Loop through extents and read slices from extents that are in the
@@ -638,7 +769,6 @@ impl FuseFS {
         };
         self.set_inode_attr(inode, new_attr);
         Ok(data_bytes)
-
     }
 
     fn read_directory(&self, inode: INodeNo) -> Result<DirectoryEntries, Errno> {
@@ -706,6 +836,10 @@ impl FuseFS {
         // cursed now, so who cares.
         // Write pieces of serialized entries into block extents
         // debug!("original extents: {:?}", attr.extent_index);
+        // TODO: Should we be updating inode attributes here? It seems like we
+        // can also do this later in the Filesystem implementation, but it's
+        // worth being consistent. Seems like we should. We should remove any
+        // further updates later on when we call this.
         for ex in &attr.extent_index {
             b_entries = match self.write_extent(ex, b_entries) {
                 Ok(remaining_b) => remaining_b,
