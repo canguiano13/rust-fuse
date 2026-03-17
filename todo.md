@@ -4,11 +4,10 @@
 X ---- finish simple version of create function
 X ---- fix issues with indexing into inode table and inode allocation due to inode numbers starting at 1
 X ---- set backing file size to be static
----- fix problem with mutability of bitmaps
----- make sure that create actually works without an input/output error
+X ---- fix problem with mutability of bitmaps (i think this is done?)
+X ---- make sure that create actually works without an input/output error
 ---- finish implementations of write/read file and try to clean things up/simplify a bit
 ---- run clippy and cargo fmt
-
 
 ---- serialize with postcard instead of serde_json
 

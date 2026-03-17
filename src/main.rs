@@ -541,11 +541,26 @@ impl FuseFS {
 
     // NOTE: None of this stuff is thread-safe (for now). Concurrent writes to
     // a file are possible, and data may be corrupted.
-    // fn write_file(&self, inode_attr: InodeAttributes, data: &Vec<u8>, offset: u64) -> Result<u64, Errno> {
+    fn write_file(&self, inode: INodeNo, data: &Vec<u8>, offset: u64) -> Result<u64, Errno> {
+        // Disallow the write if the offset is beyond the size of the file
+        // Compute mapping of offset and size of the data to specific slices
+        // file extents; we may need to add extents to the file.
+        // Write data to the slices of the extents
+        // Update metadata and return
+    }
 
-    // }
+    fn read_file(&self, inode: INodeNo, offset: u64, size: u32) -> Result<Vec<u8>, Errno> {
+        // Get inode attributes from inode table
+        let attr = match self.get_inode_attr(inode) {
+            Ok(i) => i,
+            Err(e) => return Err(e),
+        };
+        // Compute mapping of offset and size to specific slices of file extents
+        // Check if the read will go beyond the size of the file
+        // Collect bytes from the specific slices that the read corresponds to
+        // Update metadata and return
 
-    // fn read_file(&self, inode_attr: InodeAttributes, offset: u64, size: u64) -> Result<Vec<u8>, Errno> {}
+    }
 
 
     fn read_directory(&self, inode: INodeNo) -> Result<DirectoryEntries, Errno> {
@@ -938,29 +953,124 @@ impl Filesystem for FuseFS {
         );
     }
 
-    // // Adding read and write, still needs much work
+    // // read data
     // fn read(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64,
-    //         size: u32, _flags: OpenFlags, _lock: Option<LockOwner>, reply: ReplyData) {
-    //     // check if inode really exist
-    //     if self.meta.inode_bitmap.get(ino.0 as usize).is_none() {
-    //         // If the bit is 0, file doesn't exist
-    //         reply.error(Errno::ENOENT);
-    //         return;
+    //     size: u32, _flags: OpenFlags, _lock: Option<LockOwner>, reply: ReplyData) {
+
+    //     // check inode is allocated in bitmap
+    //     let chunk = ino.0 as usize / 1024;
+    //     let bit = ino.0 as usize % 1024;
+
+    //     let inode_bitmap_binding = self.inode_bitmap.read().unwrap();
+    //     let bitmap_chunk = match inode_bitmap_binding.get(chunk) {
+    //         Some(slot) => slot,
+    //         None => return reply.error(Errno::ENOENT),
+    //     };
+    //     if !bitmap_chunk.get(bit) {
+    //         return reply.error(Errno::ENOENT);
+    //     }
+    //     drop(inode_bitmap_binding);
+
+    //     // get inode from inode table
+    //     let inode_table_binding = self.inode_table.read().unwrap();
+    //     let inode = match inode_table_binding.get(ino.0 as usize) {
+    //         Some(ino) => ino,
+    //         None => return reply.error(Errno::ENOENT),
+    //     };
+
+    //     let block_size = self.superblock.block_size as u64;
+    //     let mut bytes_read_total = 0u64;
+    //     let mut result = vec![0u8; size as usize];
+
+    //     // walk extents to read data
+    //     let mut remaining = size as u64;
+    //     let mut current_offset = offset;
+
+    //     for (block_idx, _length) in inode.extent_index.iter() {
+    //         if remaining == 0 {
+    //             break;
+    //         }
+    //         if *block_idx == 0 {
+    //             continue;
+    //         }
+
+    //         let block_num = current_offset / block_size;
+    //         let block_offset = current_offset % block_size;
+    //         let bytes_to_read = remaining.min(block_size - block_offset);
+
+    //         let read_offset = self.offset_from_block_idx(*block_idx) + block_offset;
+    //         let buf_start = bytes_read_total as usize;
+    //         let buf_end = buf_start + bytes_to_read as usize;
+
+    //         match self.block_store_fd.read_at(&mut result[buf_start..buf_end], read_offset) {
+    //             Ok(n) => {
+    //                 bytes_read_total += n as u64;
+    //                 remaining -= n as u64;
+    //                 current_offset += n as u64;
+    //             }
+    //             Err(_) => return reply.error(Errno::EIO),
+    //         }
+
+    //         let _ = block_num; // suppress unused warning
     //     }
 
-    //     // calculate start location, start from superblock and jump slots
-    //     let file_base_address = self.superblock.data_start + (ino.0 * self.superblock.block_size as u64);
+    //     reply.data(&result[..bytes_read_total as usize]);
+    // }
 
-    //     // create buffer, value starts at 0, type is u8
-    //     let mut buffer = vec![0u8; size as usize];
+    // fn write(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64,
+    //      data: &[u8], _write_flags: WriteFlags, _flags: OpenFlags,
+    //      _lock_owner: Option<LockOwner>, reply: fuser::ReplyWrite) {
 
-    //     // Adding file to buffer at exact offset address, check if read is
-    //     // successful and return data, otherwise just return error
-    //     match self.block_store_fd.read_at(&mut buffer, file_base_address + offset as u64) {
-    //         Ok(bytes_read) => reply.data(&buffer[..bytes_read]),
+    //     // get the inode from the inode table
+    //     let mut inode_table_binding= self.inode_table.write().unwrap();
+    //     let inode = match inode_table_binding.get_mut(ino.0 as usize) {
+    //         Some(ino) => ino,
+    //         None => return reply.error(Errno::ENOENT),
+    //     };
+
+    //     // figure out which block the offset falls into
+    //     let block_size = self.superblock.block_size as u64;
+    //     let block_num = offset / block_size;
+    //     let block_offset = offset % block_size;
+
+    //     // check if we already have a block allocated for this position
+    //     let block_idx = if inode.extent_index[block_num as usize].0 != 0 {
+    //         // block already allocated, reuse it
+    //         inode.extent_index[block_num as usize].0
+    //     } else {
+    //         // allocate a new block
+    //         let new_block = match self.allocate_block() {
+    //             Some(b) => b,
+    //             None => return reply.error(Errno::ENOSPC),
+    //         };
+    //         inode.extent_index[block_num as usize] = (new_block, 1);
+    //         new_block
+    //     };
+
+    //     // calculate the byte offset into the data region
+    //     let write_offset = self.offset_from_block_idx(block_idx) + block_offset;
+
+    //     // write data to disk
+    //     match self.block_store_fd.write_at(data, write_offset) {
+    //         Ok(bytes_written) => {
+    //             // update inode size if needed
+    //             let new_size = offset + bytes_written as u64;
+    //             if new_size > inode.size {
+    //                 inode.size = new_size;
+    //             }
+
+    //             // persist inode to disk
+    //             if let Err(e) = self.write_inode(ino.0, inode) {
+    //                 error!("failed to persist inode {}: {}", ino.0, e);
+    //                 return reply.error(Errno::EIO);
+    //             }
+
+    //             reply.written(bytes_written as u32);
+    //         }
     //         Err(_) => reply.error(Errno::EIO),
     //     }
     // }
+
 }
 
 #[derive(Parser)]
