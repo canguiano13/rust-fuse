@@ -41,6 +41,8 @@ use fuser::LockOwner;
 use fuser::ReplyData;
 use fuser::Config;
 use fuser::Errno;
+use fuser::TimeOrNow;
+use fuser::TimeOrNow::Now;
 
 const FSID: u32 = 0x55555;
 const META_FILE_NAME: &str = "meta.fs";
@@ -201,8 +203,8 @@ impl MetaSerializable {
         };
         Meta {
             superblock: self.superblock.clone(),
-            inode_bitmap,
-            data_bitmap,
+            inode_bitmap: RwLock::new(inode_bitmap.clone()),
+            data_bitmap: RwLock::new(data_bitmap.clone()),
             inode_table: RwLock::new(self.inode_table.clone()),
         }
     }
@@ -212,15 +214,16 @@ const BITMAP_CHUNK_BITS: usize  = 1024;
 
 struct Meta {
     superblock: Superblock,
-    inode_bitmap: Vec<Bitmap<BITMAP_CHUNK_BITS>>,
-    data_bitmap: Vec<Bitmap<BITMAP_CHUNK_BITS>>,
+    inode_bitmap: RwLock<Vec<Bitmap<BITMAP_CHUNK_BITS>>>,
+    data_bitmap: RwLock<Vec<Bitmap<BITMAP_CHUNK_BITS>>>,
     inode_table: RwLock<InodeTable>,
 }
 
 impl Meta {
     fn to_meta_serializable(&self) -> MetaSerializable {
         let mut inode_bmap_bool: Vec<bool> = Vec::new();
-        for chunk in &self.inode_bitmap {
+        let inode_bitmap_binding = self.inode_bitmap.read().unwrap();
+        for chunk in inode_bitmap_binding.iter() {
             for i in 0..BITMAP_CHUNK_BITS {
                 if chunk.get(usize::try_from(i).unwrap()) {
                     inode_bmap_bool.push(true)
@@ -230,7 +233,8 @@ impl Meta {
             }
         };
         let mut data_bmap_bool: Vec<bool> = Vec::new();
-        for chunk in &self.data_bitmap {
+        let data_bitmap_binding = self.data_bitmap.read().unwrap();
+        for chunk in data_bitmap_binding.iter() {
             for i in 0..BITMAP_CHUNK_BITS {
                 if chunk.get(usize::try_from(i).unwrap()) {
                     data_bmap_bool.push(true)
@@ -289,8 +293,10 @@ impl FuseFS {
             Meta {
                 superblock: Superblock::new(block_size, num_inodes, num_blocks),
                 // TODO: Check if this syntax actually does what you want it to do.
-                inode_bitmap: vec![Bitmap::<BITMAP_CHUNK_BITS>::new(); num_inodes as usize / BITMAP_CHUNK_BITS],
-                data_bitmap: vec![Bitmap::<BITMAP_CHUNK_BITS>::new(); num_blocks as usize / BITMAP_CHUNK_BITS],
+                inode_bitmap: RwLock::new(
+                    vec![Bitmap::<BITMAP_CHUNK_BITS>::new(); num_inodes as usize / BITMAP_CHUNK_BITS]),
+                data_bitmap: RwLock::new(
+                    vec![Bitmap::<BITMAP_CHUNK_BITS>::new(); num_blocks as usize / BITMAP_CHUNK_BITS]),
                 inode_table: RwLock::new(vec![InodeAttributes::default(); num_inodes as usize]),
             }
         };
@@ -345,7 +351,8 @@ impl FuseFS {
     // None. We currently just use a simple linear search.
     // NOTE (side-effect): This function may change inode bitmap state.
     fn allocate_inode(&self) -> Option<INodeNo> {
-        for (chunk_idx, chunk) in self.meta.inode_bitmap.iter().enumerate() {
+        let mut inode_bitmap_binding = self.meta.inode_bitmap.write().unwrap();
+        for (chunk_idx, chunk) in inode_bitmap_binding.iter().enumerate() {
             // check each bit until we find a free space, skipping index 0
             // NOTE: inode 0 is just not allowed in Linux filesystems it seems,
             // so avoid ever allocating it and just keep it false/empty in the
@@ -354,9 +361,7 @@ impl FuseFS {
             // never deallocated, but we also skip it here for completeness.
             match chunk.next_false_index(1) {
                 Some(i) => {
-                    // Get mutable chunk here
-                    let mut mutable_chunk = self.meta.inode_bitmap[chunk_idx];
-                    mutable_chunk.set(i, true);
+                    inode_bitmap_binding[chunk_idx].set(i, true);
                     // Wrap in INodeNo (which fuser provides)
                     return Some(INodeNo(((chunk_idx * BITMAP_CHUNK_BITS) + i) as u64));
                 },
@@ -369,8 +374,8 @@ impl FuseFS {
     fn free_inode(&self, inode: INodeNo) {
         let chunk_idx = inode.0 as usize / BITMAP_CHUNK_BITS;
         let bit_idx = inode.0 as usize % BITMAP_CHUNK_BITS;
-        let mut mutable_chunk = self.meta.inode_bitmap[chunk_idx];
-        mutable_chunk.set(bit_idx, false);
+        let mut inode_bitmap_binding = self.meta.inode_bitmap.write().unwrap();
+        inode_bitmap_binding[chunk_idx].set(bit_idx, false);
     }
 
     fn set_inode_attr(&self, inode: INodeNo, attr: InodeAttributes) {
@@ -381,7 +386,7 @@ impl FuseFS {
         let chunk = inode.0 as usize / BITMAP_CHUNK_BITS;
         let bit = inode.0 as usize % BITMAP_CHUNK_BITS;
         // Check if inode is actually allocated in the bitmap
-        match self.meta.inode_bitmap.get(chunk) {
+        match self.meta.inode_bitmap.read().unwrap().get(chunk) {
             None => {
                 return Err(Errno::ENOENT)
             }
@@ -396,6 +401,32 @@ impl FuseFS {
         Ok(itable[inode.0 as usize].clone())
     }
 
+    // Number of blocks allocated for file
+    fn blocks_allocated(&self, size: u64) -> u64 {
+        return size.div_ceil(u64::from(self.meta.superblock.block_size as u64))
+    }
+
+    // Helper to convert InodeAttributes to FileAttr
+    fn inode_attr_to_file_attr(&self, i: &InodeAttributes) -> fuser::FileAttr {
+        fuser::FileAttr {
+            ino: INodeNo(i.inode),
+            size: i.size,
+            blocks: i.size.div_ceil(u64::from(self.meta.superblock.block_size as u64)),
+            atime: system_time_from_time(i.last_accessed.0, i.last_accessed.1),
+            mtime: system_time_from_time(i.last_modified.0, i.last_modified.1),
+            ctime: system_time_from_time(i.last_metadata_changed.0, i.last_metadata_changed.1),
+            crtime: std::time::UNIX_EPOCH,
+            kind: i.kind.into(),
+            perm: i.mode,
+            nlink: i.hardlinks,
+            uid: i.uid,
+            gid: i.gid,
+            rdev: 0,
+            blksize: self.meta.superblock.block_size,
+            flags: 0,
+        }
+    }
+
     // If space is available of the desired size, allocate that space by setting
     // all corresponding data bitmap bits and return the associatd extent(s).
     // Otherwise, return None.
@@ -408,7 +439,8 @@ impl FuseFS {
         let mut num_blocks_needed = size / (self.meta.superblock.block_size as usize) + 1;
         let mut extents: Vec<Extent> = Vec::new();
         // Find list of extents with total desired size
-        for (chunk_idx, chunk) in self.meta.data_bitmap.iter().enumerate() {
+        let mut data_bitmap_binding = self.meta.data_bitmap.write().unwrap();
+        for (chunk_idx, chunk) in data_bitmap_binding.iter().enumerate() {
             let base_offset = chunk_idx * BITMAP_CHUNK_BITS;
             let mut ex_open: usize;
             let mut ex_size: usize = 0;
@@ -444,10 +476,10 @@ impl FuseFS {
                     for ex in &extents {
                         let open = ex.0;
                         let size = ex.1;
-                        let mut mutable_chunk = self.meta.data_bitmap[open as usize / BITMAP_CHUNK_BITS];
+                        let chunk_idx = open as usize / BITMAP_CHUNK_BITS;
                         let bit_offset_open = open as usize % BITMAP_CHUNK_BITS;
                         for i in bit_offset_open..(bit_offset_open + size as usize) {
-                            mutable_chunk.set(i as usize, true);
+                            data_bitmap_binding[chunk_idx].set(i as usize, true);
                         }
                     }
                     return Some(extents)
@@ -661,7 +693,7 @@ impl Filesystem for FuseFS {
         let root_inode: u64 = INodeNo::ROOT.0;
         // Allocate first inode for root
         // TODO: If root is 1, this causes other problems for inode allocation above.
-        self.meta.inode_bitmap[0].set(root_inode as usize, true);
+        self.meta.inode_bitmap.write().unwrap()[0].set(root_inode as usize, true);
         let root_inode_attr = InodeAttributes {
             inode: root_inode,
             open_file_handles: 0,
@@ -711,26 +743,30 @@ impl Filesystem for FuseFS {
             }
         };
         // Convert InodeAttributes to fuser::FileAttr
-        let attrs = fuser::FileAttr {
-            ino,
-            size: inode.size,
-            blocks: inode.size.div_ceil(u64::from(self.meta.superblock.block_size as u64)),
-            atime: system_time_from_time(inode.last_accessed.0, inode.last_accessed.1),
-            mtime: system_time_from_time(inode.last_modified.0, inode.last_modified.1),
-            ctime: system_time_from_time(inode.last_metadata_changed.0, inode.last_metadata_changed.1),
-            crtime: std::time::UNIX_EPOCH,
-            kind: inode.kind.into(),
-            perm: inode.mode,
-            nlink: inode.hardlinks,
-            uid: inode.uid,
-            gid: inode.gid,
-            rdev: 0,
-            blksize: self.meta.superblock.block_size,
-            flags: 0,
-        };
+        let attrs = self.inode_attr_to_file_attr(&inode);
         // Return attributes in the appropriate way
         reply.attr(&std::time::Duration::from_secs(1), &attrs);
     }
+
+    // fn setattr(
+    //     &self,
+    //     _req: &Request,
+    //     ino: INodeNo,
+    //     mode: Option<u32>,
+    //     uid: Option<u32>,
+    //     gid: Option<u32>,
+    //     size: Option<u64>,
+    //     _atime: Option<TimeOrNow>,
+    //     _mtime: Option<TimeOrNow>,
+    //     _ctime: Option<SystemTime>,
+    //     fh: Option<FileHandle>,
+    //     _crtime: Option<SystemTime>,
+    //     _chgtime: Option<SystemTime>,
+    //     _bkuptime: Option<SystemTime>,
+    //     _flags: Option<fuser::BsdFileFlags>,
+    //     reply: fuser::ReplyAttr,
+    // ) {
+    // }
 
     fn readdir(&self, _req: &Request,
                ino: INodeNo,
@@ -777,23 +813,7 @@ impl Filesystem for FuseFS {
         };
 
         // Convert InodeAttributes to fuser::FileAttr
-        let attrs = fuser::FileAttr {
-            ino: parent,
-            size: inode.size,
-            blocks: inode.size.div_ceil(u64::from(self.meta.superblock.block_size as u64)),
-            atime: system_time_from_time(inode.last_accessed.0, inode.last_accessed.1),
-            mtime: system_time_from_time(inode.last_modified.0, inode.last_modified.1),
-            ctime: system_time_from_time(inode.last_metadata_changed.0, inode.last_metadata_changed.1),
-            crtime: std::time::UNIX_EPOCH,
-            kind: inode.kind.into(),
-            perm: inode.mode,
-            nlink: inode.hardlinks,
-            uid: inode.uid,
-            gid: inode.gid,
-            rdev: 0,
-            blksize: self.meta.superblock.block_size,
-            flags: 0,
-        };
+        let attrs = self.inode_attr_to_file_attr(&inode);
 
         // NOTE: I don't really know what the Generation(0) thing is doing.
         reply.entry(&std::time::Duration::from_secs(1), &attrs, fuser::Generation(0));
@@ -830,6 +850,9 @@ impl Filesystem for FuseFS {
         };
         parent_attrs.last_modified = time_now();
         parent_attrs.last_metadata_changed = time_now();
+        // You can tell things are dark when I'm just cloning everything...
+        // One day I'll be better at Rust. I promise. (:
+        self.set_inode_attr(parent, parent_attrs.clone());
 
         // Create new inode attributes
         let inode = InodeAttributes {
@@ -847,30 +870,8 @@ impl Filesystem for FuseFS {
             extent_index: Vec::new(),
         };
 
-        // NOTE: It really might be useful to have a conversion from InodeAttributes
-        // to FileAttrs, but this would require a restructuring of the code to
-        // do cleanly. I guess we could have a helper function inside FuseFS that
-        // does the conversion without talking about impls, but that's TODO.
-
-        // Generate fuser::FileAttr from InodeAttributes for reply later on
-        let attrs = fuser::FileAttr {
-            ino: parent,
-            size: inode.size,
-            blocks: inode.size.div_ceil(u64::from(self.meta.superblock.block_size as u64)),
-            atime: system_time_from_time(inode.last_accessed.0, inode.last_accessed.1),
-            mtime: system_time_from_time(inode.last_modified.0, inode.last_modified.1),
-            ctime: system_time_from_time(inode.last_metadata_changed.0, inode.last_metadata_changed.1),
-            crtime: std::time::UNIX_EPOCH,
-            kind: inode.kind.into(),
-            perm: inode.mode,
-            nlink: inode.hardlinks,
-            uid: inode.uid,
-            gid: inode.gid,
-            rdev: 0,
-            blksize: self.meta.superblock.block_size,
-            flags: 0,
-        };
-
+        // Generate fuser::FileAttr from InodeAttributes for reply
+        let attrs = self.inode_attr_to_file_attr(&inode);
         // Add new inode to inode table
         self.set_inode_attr(ino, inode);
 
@@ -889,13 +890,19 @@ impl Filesystem for FuseFS {
         };
 
         // Add the specified name to the parent directory
-        let mut parent_entries = self.read_directory(parent).unwrap();
         let name_string = match name.to_str() {
             Some(s) => s.to_string(),
             None => {
                 reply.error(Errno::EINVAL);
                 return
             },
+        };
+        let mut parent_entries = match self.read_directory(parent) {
+            Ok(es) => es,
+            Err(e) => {
+                reply.error(e);
+                return
+            }
         };
         parent_entries.insert(name_string, (ino.0, as_file_kind(mode)));
         match self.write_directory(parent, &parent_entries) {
@@ -905,11 +912,31 @@ impl Filesystem for FuseFS {
                 return;
             }
         };
+        debug!("new parent entries {:?}", parent_entries);
+
+        // let tt = time_now();
+        // let attrs = fuser::FileAttr {
+        //     ino,
+        //     size: 0,
+        //     blocks: 0,
+        //     atime: system_time_from_time(tt.0, tt.1),
+        //     mtime: system_time_from_time(tt.0, tt.1),
+        //     ctime: system_time_from_time(tt.0, tt.1),
+        //     crtime: std::time::UNIX_EPOCH,
+        //     kind: fuser::FileType::RegularFile,
+        //     perm: 0o644,
+        //     nlink: 1,
+        //     uid: req.uid(),
+        //     gid: req.gid(),
+        //     rdev: 0,
+        //     blksize: self.meta.superblock.block_size,
+        //     flags: 0,
+        // };
 
         // Return successful completion
-        info!("Created file {:?}", name);
+        info!("Created file {:?} with {ino:?}", name);
         reply.created(
-            &Duration::new(0, 0),
+            &Duration::from_secs(1),
             &attrs,
             fuser::Generation(0),
             // Not really doing anything with FileHandles in this implementation.
