@@ -542,6 +542,7 @@ impl FuseFS {
 
     // NOTE: None of this stuff is thread-safe (for now). Concurrent writes to
     // a file are possible, and data may be corrupted.
+    // TODO: Write seems to overwriting from the start when we append?
     fn write_file(&self, inode: INodeNo, offset: u64, data: &Vec<u8>) -> Result<u64, Errno> {
         // Get inode attributes from inode table
         let attr = match self.get_inode_attr(inode) {
@@ -604,6 +605,14 @@ impl FuseFS {
                     // And then continue the loop over extents
                 }
             } else if remaining_blocks_to_offset != 0 {
+                // In this case, we haven't yet found the offset block and we
+                // need to continue looking for it before we can start reading
+                // NOTE: At this point, we know that ex_size <= remaining_blocks_to_offset
+                // so we can mark this extent as covered --- decreasing the
+                // remaining blocks counter by its size (in blocks) --- and
+                // continuing with the loop.
+                remaining_blocks_to_offset -= ex_size;
+            } else {
                 // In this case, we've already passed the offset block and are
                 // in the write section
                 let ex_start_byte_i = ex.0 * self.meta.superblock.block_size as u64;
@@ -630,14 +639,6 @@ impl FuseFS {
                     current_data_index = end_data_index;
                     // And then continue the loop over extents
                 }
-            } else {
-                // In this case, we haven't yet found the offset block and we
-                // need to continue looking for it before we can start reading
-                // NOTE: At this point, we know that ex_size <= remaining_blocks_to_offset
-                // so we can mark this extent as covered --- decreasing the
-                // remaining blocks counter by its size (in blocks) --- and
-                // continuing with the loop.
-                remaining_blocks_to_offset -= ex_size;
             }
         };
         if remaining_bytes_to_write == 0 {
@@ -711,12 +712,15 @@ impl FuseFS {
             return Err(Errno::EINVAL)
         };
         // Check if the read will go beyond the size of the file
+        // NOTE: It looks like the cat shell operation reads in chunks of 4096
+        // bytes by default on my machine, so we need to allow for cases where
+        // the size passed here isn't exactly within bounds.
         let adjust_size = if offset + size as u64 > attr.size {
             (attr.size - offset) as u32
         } else {
             size
         };
-        debug!("adjusted size: {:?}", adjust_size);
+        // debug!("adjusted size: {:?}", adjust_size);
 
         // Compute mapping of offset and size to specific slices of file extents
         // Compute index of block (within the file) that the offset starts in
