@@ -20,6 +20,7 @@ X ---- finish implementations of write/read file and try to clean things up/simp
 - a big challenge: figuring out serialization of metadata and doing conversions in code
 --- a compromise: two files, one for metadata serialization, the other that actually holds backing store
 - another challenge: implementing the logic to handle reading/writing file extents
+- rust type system not strong enough to express higher-level behavioral properties, like this number should not be negative when used as an index here
 
 extra shit:
 - Actually serialize metadata to vec of u8s and use rkyv (or another more efficient serialization format

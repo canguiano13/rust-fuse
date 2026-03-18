@@ -3,7 +3,7 @@ use std::io;
 use std::io::Error;
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
-use std::os::unix::ffi::OsStrExt;
+// use std::os::unix::ffi::OsStrExt;
 use std::io::ErrorKind;
 use std::io::BufReader;
 use std::io::BufRead;
@@ -27,8 +27,6 @@ use bitmaps::Bitmap;
 
 use serde::Deserialize;
 use serde::Serialize;
-// use serde::Serializer;
-// use serde::Deserializer;
 
 use fuser::Filesystem;
 use fuser::SessionACL;
@@ -43,7 +41,6 @@ use fuser::ReplyData;
 use fuser::Config;
 use fuser::Errno;
 use fuser::TimeOrNow;
-use fuser::TimeOrNow::Now;
 
 const FSID: u32 = 0x55555;
 const META_FILE_NAME: &str = "meta.fs";
@@ -543,6 +540,7 @@ impl FuseFS {
     // NOTE: None of this stuff is thread-safe (for now). Concurrent writes to
     // a file are possible, and data may be corrupted.
     // TODO: Write seems to overwriting from the start when we append?
+    // Or at least it's writing kind of weirdly...need to look into this.
     fn write_file(&self, inode: INodeNo, offset: u64, data: &Vec<u8>) -> Result<u64, Errno> {
         // Get inode attributes from inode table
         let attr = match self.get_inode_attr(inode) {
@@ -570,11 +568,11 @@ impl FuseFS {
             // TODO: There might be an off-by-one error here, so watch out.
             // Ideally write some tests for this, but time may not allow.
             let ex_size = ex.1;
-            if remaining_blocks_to_offset != 0 && ex_size > remaining_blocks_to_offset {
+            if ex_size > remaining_blocks_to_offset {
                 // In this case, we know that our offset is in this extent
                 let offset_block_i = ex.0 + remaining_blocks_to_offset;
                 let offset_byte_i =
-                    offset_block_i * self.meta.superblock.block_size as u64
+                    (offset_block_i * self.meta.superblock.block_size as u64)
                     + byte_in_offset_block;
                 let bytes_left_in_extent =
                     (ex_size - remaining_blocks_to_offset) * self.meta.superblock.block_size as u64
@@ -642,9 +640,18 @@ impl FuseFS {
             }
         };
         if remaining_bytes_to_write == 0 {
+            // Compute new size: if we're writing some data within the original
+            // size of the file, we don't want to update the overall size.
+            let write_max = offset + data.len() as u64;
+            let new_size = if write_max > attr.size {
+                write_max
+            } else {
+                attr.size
+            };
             // Update attributes
             let new_attr = InodeAttributes {
-                size: attr.size,
+                // Compute new size
+                size: new_size,
                 last_modified: time_now(),
                 last_metadata_changed: time_now(),
                 ..attr
@@ -653,8 +660,7 @@ impl FuseFS {
             return Ok(bytes_written as u64)
         };
         // If we still have bytes to write, we'll need to add more extents
-        let extra_bytes_needed = remaining_bytes_to_write;
-        let new_extents = match self.allocate_blocks(extra_bytes_needed) {
+        let new_extents = match self.allocate_blocks(remaining_bytes_to_write) {
             Some(exs) => exs,
             None => return Err(Errno::ENOSPC),
         };
@@ -692,7 +698,10 @@ impl FuseFS {
 
         // Update metadata and return
         let new_attr = InodeAttributes {
-            size: attr.size + extra_bytes_needed as u64,
+            // Here, we know that we've definitely written past the old size,
+            // since we've allocated new extents, so we can safely just assign
+            // the max byte index of the write as the new size.
+            size: offset + data.len() as u64,
             last_modified: time_now(),
             last_metadata_changed: time_now(),
             extent_index: all_extents,
@@ -737,7 +746,7 @@ impl FuseFS {
             // TODO: There might be an off-by-one error here, so watch out.
             // Ideally write some tests for this, but time may not allow.
             let ex_size = ex.1;
-            if remaining_blocks_to_offset != 0 && ex_size > remaining_blocks_to_offset {
+            if ex_size > remaining_blocks_to_offset {
                 // In this case, we know that our offset is in this extent
                 let offset_block_i = ex.0 + remaining_blocks_to_offset;
                 let offset_byte_i =
