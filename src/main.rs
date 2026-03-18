@@ -1317,6 +1317,255 @@ impl Filesystem for FuseFS {
     //     reply.entry(&Duration::new(0, 0), &attrs.into(), fuser::Generation(0));
     // }
 
+    //create a symbolic link
+    fn symlink(&self, _req: &Request, parent: INodeNo, link_name: &OsStr, target: &Path, reply: ReplyEntry){
+
+        // check if there is space in the inode table, if there is reserve the space
+        let free_inode_idx = self.allocate_inode();
+        //no space in inode table
+        if free_inode_idx.is_none(){
+            return reply.error(Errno::ENOSPC);
+        }
+        let inode_idx = free_inode_idx.unwrap();
+
+        // check if there is space in the data region and then try to allocate space for the symlink
+        let free_block_idx = self.allocate_block();
+        //no space in data region
+        if free_block_idx.is_none(){
+            return reply.error(Errno::ENOSPC);
+        }
+        let block_idx = free_block_idx.unwrap();
+
+        //store target link path as slice of bytes in data region
+        let path_bytes = target.as_os_str().as_encoded_bytes();
+        let offset = self.offset_from_block_idx(block_idx);
+
+        //try to write the path into a data block
+        let res = self.block_store_fd.write_at(path_bytes, offset);
+        if res.is_err(){
+            return reply.error(Errno::EIO);
+        }
+
+        //create an inode for the symlink
+        let symlink_attrs = InodeAttributes{
+            inode: inode_idx,
+            open_file_handles: 0,
+            size: path_bytes.len() as u64,
+            kind: FileKind::Symlink,
+            hardlinks: 1,
+            mode: 0o644,
+            uid: _req.uid(),
+            gid: _req.gid(),
+            extent_index: [(block_idx, 1), (0,0), (0,0), (0,0), (0,0), (0,0), (0,0), (0,0)],
+            ..Default::default()
+        };
+
+        //need to return a fuser fileattr
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+
+        let attrs = fuser::FileAttr {
+            ino: INodeNo(inode_idx),
+            size: symlink_attrs.size,
+            blocks: self.blocks_allocated(symlink_attrs.size),
+            atime: std::time::UNIX_EPOCH + std::time::Duration::new(now.as_secs(), now.subsec_nanos()),
+            mtime: std::time::UNIX_EPOCH + std::time::Duration::new(now.as_secs(), now.subsec_nanos()),
+            ctime: std::time::UNIX_EPOCH + std::time::Duration::new(now.as_secs(), now.subsec_nanos()),
+            crtime: std::time::UNIX_EPOCH,
+            kind: fuser::FileType::Symlink,
+            perm: 0o644,
+            nlink: 1,
+            uid: _req.uid(),
+            gid: _req.gid(),
+            rdev: 0,
+            blksize: self.superblock.block_size,
+            flags: 0
+        };
+
+        //store inode in inode table
+        self.set_inode_table(inode_idx, symlink_attrs);
+
+        //also add it to the parent directory
+        self.dir_entries
+            .write()
+            .unwrap()
+            .entry(parent.0)
+            .or_insert_with(Vec::new)
+            .push((inode_idx, link_name.to_string_lossy().to_string()));
+
+        reply.entry(&std::time::Duration::from_secs(1), &attrs, fuser::Generation(0));
+    }
+
+    //create a hard link
+    fn link(&self, _req: &Request, ino: INodeNo, newparent: INodeNo, newname: &OsStr, reply: ReplyEntry){
+        let chunk = ino.0 as usize / 1024;
+        let bit = ino.0 as usize % 1024;
+
+        let inode_bitmap_binding = self.inode_bitmap.read().unwrap();
+        let bitmap_chunk = match inode_bitmap_binding.get(chunk){
+            Some(slot) => slot,
+            None => return reply.error(Errno::ENOENT)
+        };
+
+        //check that the inode we're trying to link to already exists
+        if !bitmap_chunk.get(bit) {
+                reply.error(Errno::EINVAL);
+                return;
+        }
+
+        //get inode from inode table
+        let mut inode_table_binding = self.inode_table.write().unwrap();
+        let inode: &mut InodeAttributes = match inode_table_binding.get_mut(ino.0 as usize){
+            Some(ino) => ino,
+            None => return reply.error(Errno::EINVAL)
+        };
+
+        //increment the hardlinks counter in inode
+        inode.hardlinks = inode.hardlinks + 1;
+
+        //create a new entry in the parent directory
+        self.dir_entries
+            .write()
+            .unwrap()
+            .entry(newparent.0)
+            .or_insert_with(Vec::new)
+            .push((ino.0, newname.to_string_lossy().to_string()));
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+
+        let filekind = match inode.kind {
+            FileKind::File => fuser::FileType::RegularFile,
+            FileKind::Directory => fuser::FileType::Directory,
+            FileKind::Symlink => fuser::FileType::Symlink,
+        };
+
+
+        //return hardlink as fuser fileattr
+        let attrs = fuser::FileAttr{
+            ino: ino,
+            size: inode.size,
+            blocks: self.blocks_allocated(inode.size),
+            atime: std::time::UNIX_EPOCH + std::time::Duration::new(now.as_secs(), now.subsec_nanos()),
+            mtime: std::time::UNIX_EPOCH + std::time::Duration::new(now.as_secs(), now.subsec_nanos()),
+            ctime: std::time::UNIX_EPOCH + std::time::Duration::new(now.as_secs(), now.subsec_nanos()),
+            crtime: std::time::UNIX_EPOCH,
+            kind: filekind,
+            perm: inode.mode,
+            nlink: inode.hardlinks,
+            uid: _req.uid(),
+            gid: _req.gid(),
+            rdev: 0,
+            blksize: self.superblock.block_size,
+            flags: 0
+        };
+        reply.entry(&std::time::Duration::from_secs(1), &attrs, fuser::Generation(0));
+    }
+
+    //read symbolic link
+    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData){
+        //make sure the symlink inode exists
+        //check if the inode is allocated in the bitmap
+        let chunk = ino.0 as usize / 1024;
+        let bit = ino.0 as usize % 1024;
+
+        let inode_bitmap_binding = self.inode_bitmap.read().unwrap();
+        let bitmap_chunk = match inode_bitmap_binding.get(chunk){
+            Some(slot) => slot,
+            None => return reply.error(Errno::ENOENT)
+        };
+
+        if !bitmap_chunk.get(bit) {
+            reply.error(Errno::ENOENT);
+            return;
+        }
+
+        //also make sure its a symlink
+        let inode_table_binding = self.inode_table.read().unwrap();
+        let inode = match inode_table_binding.get(ino.0 as usize){
+            Some(ino) => ino,
+            None => return reply.error(Errno::EINVAL)
+        };
+        if inode.kind != FileKind::Symlink{
+            return reply.error(Errno::EINVAL);
+        }
+
+        //get the block address from the extent
+        let block_idx = inode.extent_index[0].0;
+
+        //calculate offset into data region
+        let offset = self.offset_from_block_idx(block_idx);
+
+        //buffer to read in symlink
+        //symlink stored as array of bytes
+        let mut path_bytes = vec![0u8; inode.size as usize];
+
+        //try to read the information from the data region
+        let res = self.block_store_fd.read_at(&mut path_bytes, offset);
+        if res.is_err(){
+            return reply.error(Errno::EIO);
+        }
+
+        //return symlink path as replydata
+        let bytes_read = res.unwrap();
+        reply.data(&path_bytes[..bytes_read]);
+    }
+
+    //remove a file
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty){
+        //lookup the file to get the inode number
+        let target_inode_no = self.find_dir_entry(parent.0, name);
+
+        //if target does not exist, can't unlink
+        if target_inode_no.is_none(){
+            return reply.error(Errno::ENOENT);
+        }
+        let inode_no = target_inode_no.unwrap();
+
+
+        //decrement the number of hardlinks
+        let (hardlinks, extent_idx)= match self.decrement_links(inode_no){
+            Some((link_no, extent_idx)) => (link_no, extent_idx),
+            None => return reply.error(Errno::EINVAL)
+        };
+
+        //remove from parent directory
+        let mut dir_entries_binding = self.dir_entries.write().unwrap();
+        if let Some(entries) = dir_entries_binding.get_mut(&parent.0){
+            let mut i = 0;
+            while i < entries.len(){
+                if entries[i].1.as_str() == name.to_string_lossy().as_ref(){
+                    entries.remove(i);
+                    break;
+                }
+
+                i += 1;
+            }
+        }
+        //drop the RwLock for dir_entries
+        drop(dir_entries_binding);
+
+
+        //if this was the last link, release the data
+        if hardlinks == 1{
+            //remove the inode from the inode table
+            self.free_inode(inode_no);
+
+            //clear all data in data region used by file
+            for(start_block, length) in extent_idx{
+                if start_block != 0{
+                    for block_idx in start_block..(start_block + length){
+                        self.free_block(block_idx);
+                    }
+                }
+            }
+        }
+
+        reply.ok();
+    }
+
 }
 
 #[derive(Parser)]
@@ -1565,7 +1814,7 @@ mod tests {
             assert!(false);
         }
 
-        
+
         let root_inode = InodeAttributes {
             inode: root_inode_idx as u64,
             size: 0,
@@ -1590,8 +1839,8 @@ mod tests {
         let inode_table_binding = fs.inode_table.read().unwrap();
         let expect_root_inode = match inode_table_binding.get(root_inode_idx){
             Some(ino) => ino,
-            None => &InodeAttributes { 
-                inode: 0, 
+            None => &InodeAttributes {
+                inode: 0,
                 hardlinks: 0,
                 mode: 0,
                 ..Default::default()
@@ -1605,7 +1854,7 @@ mod tests {
 
         // Verify permissions
         assert_eq!(expect_root_inode.mode, 0o755);
-    }   
+    }
 
 
     #[test]
@@ -1619,7 +1868,7 @@ mod tests {
         //verify that the first space in inode table is free for a new fs
         let first_free_inode = fs.next_free_inode();
         assert_eq!(first_free_inode, Some(0));
-        
+
     }
     #[test]
     //try to allocate space for an inode in a full inode table
@@ -1766,7 +2015,7 @@ mod tests {
         fs.write_inode(5, &inode).expect("write_inode should succeed");
 
         // Read back from disk and verify
-        let offset = fs.superblock.itable_start 
+        let offset = fs.superblock.itable_start
             + (5 * size_of::<InodeAttributes>() as u64);
         let mut buf = vec![0u8; size_of::<InodeAttributes>()];
         fs.block_store_fd.read_at(&mut buf, offset).unwrap();
