@@ -707,10 +707,16 @@ impl FuseFS {
             Ok(i) => i,
             Err(e) => return Err(e),
         };
-        // Check if the read will go beyond the size of the file
-        if offset + size as u64 > attr.size {
+        if offset > attr.size {
             return Err(Errno::EINVAL)
         };
+        // Check if the read will go beyond the size of the file
+        let adjust_size = if offset + size as u64 > attr.size {
+            (attr.size - offset) as u32
+        } else {
+            size
+        };
+        debug!("adjusted size: {:?}", adjust_size);
 
         // Compute mapping of offset and size to specific slices of file extents
         // Compute index of block (within the file) that the offset starts in
@@ -720,7 +726,7 @@ impl FuseFS {
 
         // Store and track read data bytes
         let mut data_bytes: Vec<u8> = Vec::new();
-        let mut remaining_bytes = size as u64;
+        let mut remaining_bytes = adjust_size as u64;
         // Loop through extents and read slices from extents that are in the
         // section of the file to be read
         for ex in &attr.extent_index {
@@ -751,6 +757,14 @@ impl FuseFS {
                     // And then continue the loop over extents
                 }
             } else if remaining_blocks_to_offset != 0 {
+                // In this case, we haven't yet found the offset block and we
+                // need to continue looking for it before we can start reading
+                // NOTE: At this point, we know that ex_size <= remaining_blocks_to_offset
+                // so we can mark this extent as covered --- decreasing the
+                // remaining blocks counter by its size (in blocks) --- and
+                // continuing with the loop.
+                remaining_blocks_to_offset -= ex_size;
+            } else {
                 // In this case, we've already passed the offset block and are
                 // on our way in the section to be read
                 let ex_start_byte_i = ex.0 * self.meta.superblock.block_size as u64;
@@ -769,14 +783,6 @@ impl FuseFS {
                     remaining_bytes -= bytes_in_extent;
                     // And then continue the loop over extents
                 }
-            } else {
-                // In this case, we haven't yet found the offset block and we
-                // need to continue looking for it before we can start reading
-                // NOTE: At this point, we know that ex_size <= remaining_blocks_to_offset
-                // so we can mark this extent as covered --- decreasing the
-                // remaining blocks counter by its size (in blocks) --- and
-                // continuing with the loop.
-                remaining_blocks_to_offset -= ex_size;
             }
         };
         // Update metadata and return
@@ -1180,6 +1186,7 @@ impl Filesystem for FuseFS {
 
     // Read data
     // TODO: Read returns an invalid argument error.
+    // TODO: Also writing beyond the end of a file seems to cause a panic.
     fn read(&self,
             _req: &Request,
             ino: INodeNo,
