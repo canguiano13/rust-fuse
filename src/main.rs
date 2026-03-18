@@ -37,6 +37,7 @@ use fuser::Request;
 use fuser::INodeNo;
 use fuser::FileHandle;
 use fuser::OpenFlags;
+use fuser::WriteFlags;
 use fuser::LockOwner;
 use fuser::ReplyData;
 use fuser::Config;
@@ -541,7 +542,7 @@ impl FuseFS {
 
     // NOTE: None of this stuff is thread-safe (for now). Concurrent writes to
     // a file are possible, and data may be corrupted.
-    fn write_file(&self, inode: INodeNo, data: &Vec<u8>, offset: u64) -> Result<u64, Errno> {
+    fn write_file(&self, inode: INodeNo, offset: u64, data: &Vec<u8>) -> Result<u64, Errno> {
         // Get inode attributes from inode table
         let attr = match self.get_inode_attr(inode) {
             Ok(i) => i,
@@ -640,8 +641,14 @@ impl FuseFS {
             }
         };
         if remaining_bytes_to_write == 0 {
-            // TODO: Should we return bytes written here or just return () like write_dir?
-            // update attributes
+            // Update attributes
+            let new_attr = InodeAttributes {
+                size: attr.size,
+                last_modified: time_now(),
+                last_metadata_changed: time_now(),
+                ..attr
+            };
+            self.set_inode_attr(inode, new_attr);
             return Ok(bytes_written as u64)
         };
         // If we still have bytes to write, we'll need to add more extents
@@ -847,10 +854,6 @@ impl FuseFS {
         // cursed now, so who cares.
         // Write pieces of serialized entries into block extents
         // debug!("original extents: {:?}", attr.extent_index);
-        // TODO: Should we be updating inode attributes here? It seems like we
-        // can also do this later in the Filesystem implementation, but it's
-        // worth being consistent. Seems like we should. We should remove any
-        // further updates later on when we call this.
         for ex in &attr.extent_index {
             b_entries = match self.write_extent(ex, b_entries) {
                 Ok(remaining_b) => remaining_b,
@@ -922,15 +925,14 @@ impl Filesystem for FuseFS {
             _config: &mut fuser::KernelConfig,
     ) -> io::Result<()> {
         info!("Filesystem mounted successfully");
-        // Set up root directory as inode 0. Let's see if this causes any
-        // problems --- see note below.
         // NOTE: It looks like POSIX filesystems reserve inode 0 for other
         // purposes, such as marking deleted directory entries. Very weird.
         // https://utcc.utoronto.ca/~cks/space/blog/unix/POSIXAllowsZeroInode
         // https://news.ycombinator.com/item?id=44142955
         let root_inode: u64 = INodeNo::ROOT.0;
         // Allocate first inode for root
-        // TODO: If root is 1, this causes other problems for inode allocation above.
+        // If root is 1, we also need to fix the inode allocation logic above.
+        // NOTE: This is fixed, see that part of the code for details.
         self.meta.inode_bitmap.write().unwrap()[0].set(root_inode as usize, true);
         let root_inode_attr = InodeAttributes {
             inode: root_inode,
@@ -1176,123 +1178,49 @@ impl Filesystem for FuseFS {
         );
     }
 
-    // // read data
-    // fn read(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64,
-    //     size: u32, _flags: OpenFlags, _lock: Option<LockOwner>, reply: ReplyData) {
+    // Read data
+    // TODO: Read returns an invalid argument error.
+    fn read(&self,
+            _req: &Request,
+            ino: INodeNo,
+            _fh: FileHandle,
+            offset: u64,
+            size: u32,
+            _flags: OpenFlags,
+            _lock: Option<LockOwner>,
+            reply: ReplyData
+    ) {
+        debug!("read() called on {ino:?} offset={offset:?} size={size:?}");
+        let read_buf = match self.read_file(ino, offset, size) {
+            Ok(b) => b,
+            Err(e) => {
+                reply.error(e);
+                return
+            }
+        };
+        reply.data(&read_buf)
+    }
 
-    //     // check inode is allocated in bitmap
-    //     let chunk = ino.0 as usize / 1024;
-    //     let bit = ino.0 as usize % 1024;
-
-    //     let inode_bitmap_binding = self.inode_bitmap.read().unwrap();
-    //     let bitmap_chunk = match inode_bitmap_binding.get(chunk) {
-    //         Some(slot) => slot,
-    //         None => return reply.error(Errno::ENOENT),
-    //     };
-    //     if !bitmap_chunk.get(bit) {
-    //         return reply.error(Errno::ENOENT);
-    //     }
-    //     drop(inode_bitmap_binding);
-
-    //     // get inode from inode table
-    //     let inode_table_binding = self.inode_table.read().unwrap();
-    //     let inode = match inode_table_binding.get(ino.0 as usize) {
-    //         Some(ino) => ino,
-    //         None => return reply.error(Errno::ENOENT),
-    //     };
-
-    //     let block_size = self.superblock.block_size as u64;
-    //     let mut bytes_read_total = 0u64;
-    //     let mut result = vec![0u8; size as usize];
-
-    //     // walk extents to read data
-    //     let mut remaining = size as u64;
-    //     let mut current_offset = offset;
-
-    //     for (block_idx, _length) in inode.extent_index.iter() {
-    //         if remaining == 0 {
-    //             break;
-    //         }
-    //         if *block_idx == 0 {
-    //             continue;
-    //         }
-
-    //         let block_num = current_offset / block_size;
-    //         let block_offset = current_offset % block_size;
-    //         let bytes_to_read = remaining.min(block_size - block_offset);
-
-    //         let read_offset = self.offset_from_block_idx(*block_idx) + block_offset;
-    //         let buf_start = bytes_read_total as usize;
-    //         let buf_end = buf_start + bytes_to_read as usize;
-
-    //         match self.block_store_fd.read_at(&mut result[buf_start..buf_end], read_offset) {
-    //             Ok(n) => {
-    //                 bytes_read_total += n as u64;
-    //                 remaining -= n as u64;
-    //                 current_offset += n as u64;
-    //             }
-    //             Err(_) => return reply.error(Errno::EIO),
-    //         }
-
-    //         let _ = block_num; // suppress unused warning
-    //     }
-
-    //     reply.data(&result[..bytes_read_total as usize]);
-    // }
-
-    // fn write(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64,
-    //      data: &[u8], _write_flags: WriteFlags, _flags: OpenFlags,
-    //      _lock_owner: Option<LockOwner>, reply: fuser::ReplyWrite) {
-
-    //     // get the inode from the inode table
-    //     let mut inode_table_binding= self.inode_table.write().unwrap();
-    //     let inode = match inode_table_binding.get_mut(ino.0 as usize) {
-    //         Some(ino) => ino,
-    //         None => return reply.error(Errno::ENOENT),
-    //     };
-
-    //     // figure out which block the offset falls into
-    //     let block_size = self.superblock.block_size as u64;
-    //     let block_num = offset / block_size;
-    //     let block_offset = offset % block_size;
-
-    //     // check if we already have a block allocated for this position
-    //     let block_idx = if inode.extent_index[block_num as usize].0 != 0 {
-    //         // block already allocated, reuse it
-    //         inode.extent_index[block_num as usize].0
-    //     } else {
-    //         // allocate a new block
-    //         let new_block = match self.allocate_block() {
-    //             Some(b) => b,
-    //             None => return reply.error(Errno::ENOSPC),
-    //         };
-    //         inode.extent_index[block_num as usize] = (new_block, 1);
-    //         new_block
-    //     };
-
-    //     // calculate the byte offset into the data region
-    //     let write_offset = self.offset_from_block_idx(block_idx) + block_offset;
-
-    //     // write data to disk
-    //     match self.block_store_fd.write_at(data, write_offset) {
-    //         Ok(bytes_written) => {
-    //             // update inode size if needed
-    //             let new_size = offset + bytes_written as u64;
-    //             if new_size > inode.size {
-    //                 inode.size = new_size;
-    //             }
-
-    //             // persist inode to disk
-    //             if let Err(e) = self.write_inode(ino.0, inode) {
-    //                 error!("failed to persist inode {}: {}", ino.0, e);
-    //                 return reply.error(Errno::EIO);
-    //             }
-
-    //             reply.written(bytes_written as u32);
-    //         }
-    //         Err(_) => reply.error(Errno::EIO),
-    //     }
-    // }
+    fn write(&self,
+             _req: &Request,
+             ino: INodeNo,
+             _fh: FileHandle,
+             offset: u64,
+             data: &[u8],
+             _write_flags: WriteFlags,
+             _flags: OpenFlags,
+             _lock_owner: Option<LockOwner>,
+             reply: fuser::ReplyWrite
+    ) {
+        let data_written = match self.write_file(ino, offset, &data.to_vec()) {
+            Ok(n) => n,
+            Err(e) => {
+                reply.error(e);
+                return
+            }
+        };
+        reply.written(data_written as u32)
+    }
 
     // TODO: Paste in simple.rs mkdir for reference.
     // fn mkdir(
