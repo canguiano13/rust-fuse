@@ -1,9 +1,14 @@
 # rust-fuse
 Rust-based FUSE filesystem aimed to improved memory-safety and, ideally, adhere to SIM Commutativity principles.
 
+## Authors
+Carlos Anguiano, Lucas Du, Simon Zheng
+
+## Overview
+This filesystem is implemented as a FUSE userspace daemon. When a user application makes a filesystem call, the request travels through the Linux Virtual Filesystem (VFS) layer to the FUSE kernel module, which forwards it to our userspace daemon. The daemon processes the request, reads or writes data to a backing file as needed, and sends a response back through the kernel module to the calling application.
+
 ## minimalFS
 The first filesystem is an extremely minimal implementation in the style of vsfs (from OSTEP). The following design choices are made:
-- Simulate contiguous block storage by allocating a single large file (using the OS filesystem) to act as the backing store for the entire FUSE filesystem. Backing store size is fixed upon initialization.
 - Everything is stored on disk in that single large file, with the following structure: [superblock|inode-bitmap|data-bitmap|inode-table|data-region].
 - The inode table is stored as a flat array, with indices denoting inode number.
 - Use a list of extents to track data blocks for specific inodes.
@@ -12,21 +17,56 @@ The first filesystem is an extremely minimal implementation in the style of vsfs
 - No support for xattrs.
 - Not thread-safe.
 
-### to-dos
-1. Get configuration set up for various filesystem knobs, implement filesystem initialization function.
-2. Write up helper functions for allocating space on the "block storage" file.
-3. Add in serialization and implement calculation for offset/"address" calculation.
-  i. implement to_bytes and from_bytes methods for each data structure we need to serialize
-  ii. have a custom serializer and deserializer for each of the datatypes we use
-  iii. just use serde_json and have separate files for metadata and actual backing storage --- I think this one is your best bet. You'll need to have a single big struct for all the metadata though, for easy reading (without the need to calculate offsets).
-4. Implement file allocation flow: checks in inode and data bitmaps, block allocation.
-5. Implement file read and writes, including metadata changes. 
-6. Implement directory management. 
-7. Implement link counters and then file deletes.
-8. Implement basic access control with modes and UID/GID.
-9. Implement file renames.
-10. Go through rest of fuser Filesystem implementation, fill out other functions.
-11. Work through and fix edge cases, i.e. out-of-space errors.
+### Supported Operations
+- `create` — create a new file
+- `read` — read file data using extent-based addressing
+- `write` — write file data with automatic block allocation
+- `lookup` — look up a file by name in a directory
+- `readdir` — list directory contents
+- `getattr` — get file attributes
+- `symlink` / `readlink` — create and read symbolic links
+- `link` / `unlink` — create and remove hard links
+
+## Building
+```bash
+git clone 
+cd rust-fuse
+cargo build --release
+```
+
+### Mounting the Filesystem
+```bash
+# Create a mount point
+mkdir /tmp/mnt
+
+cargo run -- /tmp/mnt /tmp/blockfile -vvv
+
+```
+
+### Using the Filesystem
+```bash
+# Create a file
+echo "hello world" > /tmp/mnt/hello.txt
+
+# Read a file
+cat /tmp/mnt/hello.txt
+
+# List directory contents
+ls /tmp/mnt
+
+# Create a symbolic link
+ln -s /tmp/mnt/hello.txt /tmp/mnt/hello_link.txt
+
+# Create a hard link
+ln /tmp/mnt/hello.txt /tmp/mnt/hello_hard.txt
+
+# Remove a file
+rm /tmp/mnt/hello.txt
+```
+### Unmounting
+fusermount -u /tmp/mnt
+
+## journalFS
+An extension of minimalFS with journaling for a form of crash-recovery/consistency.
 
 ## mulcoreFS
-A partial rewrite of minimalFS/journalFS that adds thread-safety and aims to use SIM Commutativity principles to guide multicore scalable design.
