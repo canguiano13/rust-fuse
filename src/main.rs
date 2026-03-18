@@ -162,7 +162,7 @@ struct InodeAttributes {
 }
 
 // Table (flat data structure: a vector) with inodes.
-type InodeTable = Vec<InodeAttributes>;
+type InodeTable = RwLock<Vec<InodeAttributes>>;
 
 #[derive(Serialize, Deserialize)]
 struct MetaSerializable {
@@ -1466,5 +1466,507 @@ fn main() {
         } else {
             error!("{e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_superblock_layout() {
+        let sb = Superblock::new(4096, 1024, 1024);
+        assert_eq!(sb.fsid, FSID);
+        assert_eq!(sb.block_size, 4096);
+        // bitmap_start should be immediately after the superblock
+        assert_eq!(sb.bitmap_start, size_of::<Superblock>() as u64);
+        // inode table should start after both bitmaps
+        let expected_itable = sb.bitmap_start + (1024 / 8) + (1024 / 8);
+        assert_eq!(sb.itable_start, expected_itable);
+        // data should start after the inode table
+        let expected_data = sb.itable_start + size_of::<InodeAttributes>() as u64 * 1024;
+        assert_eq!(sb.data_start, expected_data);
+    }
+
+    #[test]
+    //verify properties of newly-initialized fs
+    fn test_new_filesystem_creation() {
+        let tmp = NamedTempFile::new().unwrap();
+        let fd = tmp.reopen().unwrap();
+        let fs = FuseFS::new(fd, 4096, 1024, 1024);
+
+        assert_eq!(fs.superblock.block_size, 4096);
+        assert_eq!(fs.superblock.num_inodes, 1024);
+        assert_eq!(fs.superblock.num_blocks, 1024);
+        let inode_table_binding = fs.inode_table.read().unwrap();
+        // All inodes should be unallocated initially
+        assert_eq!(inode_table_binding.len(), 1024);
+        assert!(inode_table_binding.iter().all(|i| i.inode == 0));
+    }
+
+    #[test]
+    fn test_valid_block_size_accepts_multiples_of_4096() {
+        assert!(valid_block_size("4096").is_ok());
+        assert!(valid_block_size("500").is_err());
+    }
+
+    #[test]
+    fn test_valid_bitmap_size_accepts_multiples_of_1024() {
+        assert!(valid_bitmap_size("1024").is_ok());
+        assert!(valid_bitmap_size("32768").is_ok());
+        assert!(valid_bitmap_size("500").is_err());
+    }
+
+    #[test]
+    //check attributes of default inode
+    fn test_inode_attributes_default() {
+        let inode = InodeAttributes::default();
+        assert_eq!(inode.kind, FileKind::File);
+        assert_eq!(inode.size, 0);
+        assert_eq!(inode.hardlinks, 0);
+    }
+
+    #[test]
+    //ensure empty inode bitmap for a newly-initialized fs
+    fn test_getattr_unallocated_inode_returns_none() {
+        let tmp = NamedTempFile::new().unwrap();
+        let fd = tmp.reopen().unwrap();
+        let fs = FuseFS::new(fd, 4096, 1024, 1024);
+
+        //no inodes allocated yet, every bit should be unset
+        let chunk = 0;
+        let bit = 0;
+
+        let bitmap_binding = fs.inode_bitmap.read().unwrap();
+        if let Some(bitmap_chunk) = bitmap_binding.get(chunk) {
+            assert!(!bitmap_chunk.get(bit), "bitmap should be empty on a new filesystem");
+        } else{
+            assert!(false)
+        }
+    }
+
+    #[test]
+    //simulate initialization of root inode
+    fn test_readdir_root_inode_is_directory() {
+        let tmp = NamedTempFile::new().unwrap();
+        let fd = tmp.reopen().unwrap();
+        let fs = FuseFS::new(fd, 4096, 1024, 1024);
+
+        // Simulate what init() does - set up root inode
+        let root_inode_idx = 1usize;
+        let chunk = root_inode_idx / 1024;
+        let bit = root_inode_idx % 1024;
+
+        let mut inode_bitmap_binding = fs.inode_bitmap.write().unwrap();
+        if  let Some(bitmap_chunk) = inode_bitmap_binding.get_mut(chunk){
+            bitmap_chunk.set(bit, true);
+        } else{
+            assert!(false);
+        }
+
+        
+        let root_inode = InodeAttributes {
+            inode: root_inode_idx as u64,
+            size: 0,
+            kind: FileKind::Directory,
+            mode: 0o755,
+            hardlinks: 2,
+            uid: 0,
+            gid: 0,
+            ..Default::default()
+        };
+        fs.set_inode_table(root_inode_idx as u64, root_inode);
+
+        // Verify root inode is allocated in bitmap
+        if let Some(bitmap_chunk) = inode_bitmap_binding.get(chunk){
+            assert!(bitmap_chunk.get(bit), "root inode should be allocated");
+        }
+        else{
+            assert!(false);
+        }
+
+
+        let inode_table_binding = fs.inode_table.read().unwrap();
+        let expect_root_inode = match inode_table_binding.get(root_inode_idx){
+            Some(ino) => ino,
+            None => &InodeAttributes { 
+                inode: 0, 
+                hardlinks: 0,
+                mode: 0,
+                ..Default::default()
+            }
+        };
+        // Verify root inode is a directory
+        assert_eq!(expect_root_inode.kind, FileKind::Directory);
+
+        // Verify root inode has correct hardlinks
+        assert_eq!(expect_root_inode.hardlinks, 2);
+
+        // Verify permissions
+        assert_eq!(expect_root_inode.mode, 0o755);
+    }   
+
+
+    #[test]
+    //try to allocate space for an inode in an empty inode table
+    //first space should be empty
+    fn test_next_free_inode_empty_fs() {
+        let tmp = NamedTempFile::new().unwrap();
+        let fd = tmp.reopen().unwrap();
+        let fs = FuseFS::new(fd, 4096, 1024, 1024);
+
+        //verify that the first space in inode table is free for a new fs
+        let first_free_inode = fs.next_free_inode();
+        assert_eq!(first_free_inode, Some(0));
+        
+    }
+    #[test]
+    //try to allocate space for an inode in a full inode table
+    //should indicate that no spaces are free
+    fn test_next_free_inode_full_fs() {
+        let tmp = NamedTempFile::new().unwrap();
+        let fd = tmp.reopen().unwrap();
+        let fs = FuseFS::new(fd, 4096, 1024, 1024);
+
+        //fill the bitmap using allocate_inode()
+        for _i in 0..fs.superblock.num_inodes{
+            fs.allocate_inode();
+        }
+
+        let next_free_inode = fs.next_free_inode();
+        assert_eq!(next_free_inode, None);
+    }
+
+
+    #[test]
+    //try to allocate a data block in an empty data region
+    fn test_next_free_block_empty_fs() {
+        let tmp = NamedTempFile::new().unwrap();
+        let fd = tmp.reopen().unwrap();
+        let fs = FuseFS::new(fd, 4096, 1024, 1024);
+
+        let first_free_block = fs.next_free_block();
+        assert_eq!(first_free_block, Some(0));
+    }
+    #[test]
+    //try to allocate a data block in a full data region
+    fn test_next_free_block_full_fs() {
+        let tmp = NamedTempFile::new().unwrap();
+        let fd = tmp.reopen().unwrap();
+        let fs = FuseFS::new(fd, 4096, 1024, 1024);
+
+        //fill the bitmap using allocate_block()
+        for _i in 0..fs.superblock.num_blocks{
+            fs.allocate_block();
+        }
+
+        let next_free_block = fs.next_free_block();
+        assert_eq!(next_free_block, None);
+    }
+
+    #[test]
+    //allocate an inode and check that the bitmap bit is set
+    //remaining nodes should be free
+    fn test_allocate_inode_sets_bitmap() {
+        let tmp = NamedTempFile::new().unwrap();
+        let fd = tmp.reopen().unwrap();
+        let fs = FuseFS::new(fd, 4096, 1024, 1024);
+
+        let inode_num = fs.allocate_inode().expect("should have free inodes");
+        let chunk = (inode_num / 1024) as usize;
+        let bit = (inode_num % 1024) as usize;
+
+
+        let inode_bitmap_binding = fs.inode_bitmap.read().unwrap();
+        if let Some(bitmap_chunk) = inode_bitmap_binding.get(chunk){
+            //allocate_inode should mark bit as allocated in bitmap
+            assert!(bitmap_chunk.get(bit), "bitmap bit should be set after allocation");
+        }
+        else{
+            assert!(false);
+        }
+    }
+
+    #[test]
+    //two inode allocations should return different inodes
+    fn test_allocate_inode_returns_different_inodes() {
+        let tmp = NamedTempFile::new().unwrap();
+        let fd = tmp.reopen().unwrap();
+        let fs = FuseFS::new(fd, 4096, 1024, 1024);
+
+        let inode1 = fs.allocate_inode().expect("should have free inodes");
+        let inode2 = fs.allocate_inode().expect("should still have free inodes");
+        assert_ne!(inode1, inode2, "should not allocate the same inode twice");
+    }
+
+    #[test]
+    fn test_allocate_block_sets_bitmap() {
+        let tmp = NamedTempFile::new().unwrap();
+        let fd = tmp.reopen().unwrap();
+        let fs = FuseFS::new(fd, 4096, 1024, 1024);
+
+        // Allocate a block and check the bit is set
+        let block_num = fs.allocate_block().expect("should have free blocks");
+        let chunk = (block_num / 1024) as usize;
+        let bit = (block_num % 1024) as usize;
+
+        let data_bitmap_binding= fs.data_bitmap.read().unwrap();
+        if let Some(bitmap_chunk) = data_bitmap_binding.get(chunk){
+            //allocate_block should mark bit as allocated in bitmap
+            assert!(bitmap_chunk.get(bit), "bitmap bit should be set after allocation");
+        }
+        else{
+            assert!(false);
+        }
+    }
+
+    #[test]
+    fn test_allocate_block_returns_different_blocks() {
+        let tmp = NamedTempFile::new().unwrap();
+        let fd = tmp.reopen().unwrap();
+        let fs = FuseFS::new(fd, 4096, 1024, 1024);
+
+        // Two allocations should return different blocks
+        let block1 = fs.allocate_block().expect("should have free blocks");
+        let block2 = fs.allocate_block().expect("should still have free blocks");
+        assert_ne!(block1, block2, "should not allocate the same block twice");
+    }
+
+    #[test]
+    fn test_allocate_inode_returns_none_when_full() {
+        let tmp = NamedTempFile::new().unwrap();
+        let fd = tmp.reopen().unwrap();
+        let fs = FuseFS::new(fd, 4096, 1024, 1024);
+
+        //fill up all inodes
+        for _ in 0..1024 {
+            fs.allocate_inode().expect("should have free inodes");
+        }
+
+        //attempt at allocation should return None
+        assert!(fs.allocate_inode().is_none(), "should return None when all inodes are used");
+    }
+
+    #[test]
+    fn test_write_inode_persists_to_disk() {
+        let tmp = NamedTempFile::new().unwrap();
+        let fd = tmp.reopen().unwrap();
+        let fs = FuseFS::new(fd, 4096, 1024, 1024);
+
+        let inode = InodeAttributes {
+            inode: 5,
+            size: 1234,
+            kind: FileKind::File,
+            hardlinks: 1,
+            mode: 0o644,
+            ..Default::default()
+        };
+
+        fs.write_inode(5, &inode).expect("write_inode should succeed");
+
+        // Read back from disk and verify
+        let offset = fs.superblock.itable_start 
+            + (5 * size_of::<InodeAttributes>() as u64);
+        let mut buf = vec![0u8; size_of::<InodeAttributes>()];
+        fs.block_store_fd.read_at(&mut buf, offset).unwrap();
+
+        let recovered: InodeAttributes = bincode::deserialize(&buf).unwrap();
+        assert_eq!(recovered.inode, 5);
+        assert_eq!(recovered.size, 1234);
+        assert_eq!(recovered.kind, FileKind::File);
+    }
+
+    #[test]
+    fn test_read_write_inode_roundtrip() {
+        let tmp = NamedTempFile::new().unwrap();
+        let fd = tmp.reopen().unwrap();
+        let fs = FuseFS::new(fd, 4096, 1024, 1024);
+
+        let inode = InodeAttributes {
+            inode: 5,
+            size: 1234,
+            kind: FileKind::File,
+            hardlinks: 1,
+            mode: 0o644,
+            ..Default::default()
+        };
+
+        fs.write_inode(5, &inode).expect("write should succeed");
+        let recovered = fs.read_inode(5).expect("read should succeed");
+
+        assert_eq!(recovered.inode, 5);
+        assert_eq!(recovered.size, 1234);
+        assert_eq!(recovered.kind, FileKind::File);
+    }
+
+    #[test]
+    fn test_write_stores_data_to_disk() {
+        let tmp = NamedTempFile::new().unwrap();
+        let fd = tmp.reopen().unwrap();
+        let fs = FuseFS::new(fd, 4096, 1024, 1024);
+
+        // allocate an inode manually
+        let inode_idx = fs.allocate_inode().expect("should have free inodes");
+
+        let inode = InodeAttributes {
+            inode: inode_idx,
+            size: 0,
+            kind: FileKind::File,
+            hardlinks: 1,
+            mode: 0o644,
+            ..Default::default()
+        };
+        fs.set_inode_table(inode_idx, inode);
+
+        // write some data
+        let data = b"hello world";
+        let block_idx = fs.allocate_block().expect("should have free blocks");
+        let write_offset = fs.offset_from_block_idx(block_idx);
+        fs.block_store_fd.write_at(data, write_offset).expect("write should succeed");
+
+        // read it back and verify
+        let mut buf = vec![0u8; data.len()];
+        fs.block_store_fd.read_at(&mut buf, write_offset).expect("read should succeed");
+        assert_eq!(&buf, data);
+    }
+
+    #[test]
+    fn test_read_write_extent_roundtrip() {
+        let tmp = NamedTempFile::new().unwrap();
+        let fd = tmp.reopen().unwrap();
+        let fs = FuseFS::new(fd, 4096, 1024, 1024);
+
+        // allocate an inode and a block
+        let inode_idx = fs.allocate_inode().expect("should have free inodes");
+        let block_idx = fs.allocate_block().expect("should have free blocks");
+
+        // set up inode with extent pointing to the block
+        let inode = InodeAttributes {
+            inode: inode_idx,
+            size: 11,
+            kind: FileKind::File,
+            hardlinks: 1,
+            mode: 0o644,
+            extent_index: [(block_idx, 1), (0,0), (0,0), (0,0), (0,0), (0,0), (0,0), (0,0)],
+            ..Default::default()
+        };
+        fs.set_inode_table(inode_idx, inode);
+
+        // write data directly to the block
+        let data = b"hello world";
+        let write_offset = fs.offset_from_block_idx(block_idx);
+        fs.block_store_fd.write_at(data, write_offset).expect("write should succeed");
+
+        // now read it back using the extent system
+        let inode_table_binding = fs.inode_table.read().unwrap();
+        let inode = inode_table_binding.get(inode_idx as usize).unwrap();
+
+        let mut result = vec![0u8; data.len()];
+        let read_offset = fs.offset_from_block_idx(inode.extent_index[0].0);
+        fs.block_store_fd.read_at(&mut result, read_offset).expect("read should succeed");
+
+        assert_eq!(&result, data);
+    }
+
+    #[test]
+    fn test_create_allocates_unique_inodes() {
+        let tmp = NamedTempFile::new().unwrap();
+        let fd = tmp.reopen().unwrap();
+        let fs = FuseFS::new(fd, 4096, 1024, 1024);
+
+        // allocate first inode
+        let inode1 = fs.allocate_inode().expect("should have free inodes");
+        let inode2 = fs.allocate_inode().expect("should have free inodes");
+
+        // verify they are different
+        assert_ne!(inode1, inode2, "each file should get a unique inode");
+
+        // set up inodes in the inode table
+        let new_inode1 = InodeAttributes {
+            inode: inode1,
+            size: 0,
+            kind: FileKind::File,
+            hardlinks: 1,
+            mode: 0o644,
+            ..Default::default()
+        };
+        let new_inode2 = InodeAttributes {
+            inode: inode2,
+            size: 0,
+            kind: FileKind::File,
+            hardlinks: 1,
+            mode: 0o644,
+            ..Default::default()
+        };
+        fs.set_inode_table(inode1, new_inode1);
+        fs.set_inode_table(inode2, new_inode2);
+
+        // verify both inodes are in the inode table
+        let inode_table_binding = fs.inode_table.read().unwrap();
+        let stored_inode1 = inode_table_binding.get(inode1 as usize).unwrap();
+        let stored_inode2 = inode_table_binding.get(inode2 as usize).unwrap();
+
+        assert_eq!(stored_inode1.inode, inode1);
+        assert_eq!(stored_inode2.inode, inode2);
+        assert_eq!(stored_inode1.kind, FileKind::File);
+        assert_eq!(stored_inode2.kind, FileKind::File);
+
+        // verify both are added to dir_entries
+        fs.dir_entries
+            .write()
+            .unwrap()
+            .entry(1)
+            .or_insert_with(Vec::new)
+            .push((inode1, "file1.txt".to_string()));
+
+        fs.dir_entries
+            .write()
+            .unwrap()
+            .entry(1)
+            .or_insert_with(Vec::new)
+            .push((inode2, "file2.txt".to_string()));
+
+        let dir_entries_binding = fs.dir_entries.read().unwrap();
+        let entries = dir_entries_binding.get(&1).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].1, "file1.txt");
+        assert_eq!(entries[1].1, "file2.txt");
+    }
+
+    #[test]
+    fn test_lookup_finds_existing_file() {
+        let tmp = NamedTempFile::new().unwrap();
+        let fd = tmp.reopen().unwrap();
+        let fs = FuseFS::new(fd, 4096, 1024, 1024);
+
+        // allocate an inode and set it up
+        let inode_idx = fs.allocate_inode().expect("should have free inodes");
+        let new_inode = InodeAttributes {
+            inode: inode_idx,
+            size: 0,
+            kind: FileKind::File,
+            hardlinks: 1,
+            mode: 0o644,
+            ..Default::default()
+        };
+        fs.set_inode_table(inode_idx, new_inode);
+
+        // add the file to dir_entries
+        fs.dir_entries
+            .write()
+            .unwrap()
+            .entry(1)
+            .or_insert_with(Vec::new)
+            .push((inode_idx, "test.txt".to_string()));
+
+        // verify lookup finds the file
+        let found = fs.find_dir_entry(1, std::ffi::OsStr::new("test.txt"));
+        assert!(found.is_some(), "lookup should find the file");
+        assert_eq!(found.unwrap(), inode_idx);
+
+        // verify lookup returns none for a file that doesn't exist
+        let not_found = fs.find_dir_entry(1, std::ffi::OsStr::new("missing.txt"));
+        assert!(not_found.is_none(), "lookup should return none for missing file");
     }
 }

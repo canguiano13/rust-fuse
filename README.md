@@ -20,8 +20,8 @@ The first filesystem is an extremely minimal implementation in the style of vsfs
   ii. have a custom serializer and deserializer for each of the datatypes we use
   iii. just use serde_json and have separate files for metadata and actual backing storage --- I think this one is your best bet. You'll need to have a single big struct for all the metadata though, for easy reading (without the need to calculate offsets).
 4. Implement file allocation flow: checks in inode and data bitmaps, block allocation.
-5. Implement file read and writes, including metadata changes.
-6. Implement directory management.
+5. Implement file read and writes, including metadata changes. 
+6. Implement directory management. 
 7. Implement link counters and then file deletes.
 8. Implement basic access control with modes and UID/GID.
 9. Implement file renames.
