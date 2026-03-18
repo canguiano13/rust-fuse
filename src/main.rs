@@ -562,10 +562,8 @@ impl FuseFS {
         // Compute mapping of offset and size of the data to specific slices
         // file extents; we may need to add extents to the file.
         // Write data to the slices of the extents
-        // TODO: Update metadata in this loop before returning something.
-        // TODO: Do we really need to clone here? Figure this out next, seems
-        // extremely wasteful to do this.
-        let mut remaining_bytes_to_write = data.clone();
+        let mut remaining_bytes_to_write = data.len();
+        let mut current_data_index = 0;
         for ex in &attr.extent_index {
             // TODO: There might be an off-by-one error here, so watch out.
             // Ideally write some tests for this, but time may not allow.
@@ -583,23 +581,25 @@ impl FuseFS {
                 // the offset block
                 remaining_blocks_to_offset = 0;
                 // Check if we can complete the write in this extent
-                if bytes_left_in_extent >= remaining_bytes_to_write.len() as u64 {
+                if bytes_left_in_extent >= remaining_bytes_to_write as u64 {
                     // We can complete the write in this extent
-                    self.store_fd.write_at(&mut remaining_bytes_to_write[..], offset_byte_i);
-                    remaining_bytes_to_write = remaining_bytes_to_write[bytes_left_in_extent as usize..].to_vec();
-                    // Increase number of bytes written and break from loop
-                    bytes_written += remaining_bytes_to_write.len();
+                    self.store_fd.write_at(&data[current_data_index..], offset_byte_i)?;
+                    // Increase number of bytes written, set remaining bytes to
+                    // 0, and break from loop
+                    bytes_written += remaining_bytes_to_write;
+                    remaining_bytes_to_write = 0;
                     break
                 } else {
                     // Cannot complete write in this extent
+                    let end_data_index = current_data_index + bytes_left_in_extent as usize;
                     self.store_fd.write_at(
-                        &mut remaining_bytes_to_write[..bytes_left_in_extent as usize],
-                        offset_byte_i);
-                    // NOTE: What is this conversion hack...why do I need to the to_vec()?
-                    // I presume I'm not understanding something about slices vs. vectors.
-                    remaining_bytes_to_write = &remaining_bytes_to_write[bytes_left_in_extent as usize..].to_vec();
-                    // Increase number of bytes written
+                        &data[current_data_index..end_data_index],
+                        offset_byte_i)?;
+                    // Update counters for bytes written and remaining bytes to write
                     bytes_written += bytes_left_in_extent as usize;
+                    remaining_bytes_to_write -= bytes_left_in_extent as usize;
+                    // Update current data index
+                    current_data_index = end_data_index;
                     // And then continue the loop over extents
                 }
             } else if remaining_blocks_to_offset != 0 {
@@ -607,21 +607,26 @@ impl FuseFS {
                 // in the write section
                 let ex_start_byte_i = ex.0 * self.meta.superblock.block_size as u64;
                 let bytes_in_extent = ex_size * self.meta.superblock.block_size as u64;
-                if bytes_in_extent >= remaining_bytes_to_write.len() as u64 {
+                if bytes_in_extent >= remaining_bytes_to_write as u64 {
                     // We can complete the write in this extent
-                    self.store_fd.write_at(&mut remaining_bytes_to_write[..], ex_start_byte_i);
-                    remaining_bytes_to_write = &remaining_bytes_to_write[bytes_in_extent as usize..].to_vec();
+                    self.store_fd.write_at(
+                        &data[current_data_index..],
+                        ex_start_byte_i)?;
+                    bytes_written += remaining_bytes_to_write;
+                    remaining_bytes_to_write = 0;
                     // Increase number of bytes written and break from loop
-                    bytes_written += remaining_bytes_to_write.len();
                     break
                 } else {
                     // Cannot complete write in this extent
+                    let end_data_index = current_data_index + bytes_in_extent as usize;
                     self.store_fd.write_at(
-                        &mut remaining_bytes_to_write[..bytes_in_extent as usize],
-                        ex_start_byte_i);
-                    remaining_bytes_to_write = &remaining_bytes_to_write[bytes_in_extent as usize..].to_vec();
-                    // Increase number of bytes written
+                        &data[current_data_index..end_data_index as usize],
+                        ex_start_byte_i)?;
+                    // Update counters for bytes written and remaining bytes to write
                     bytes_written += bytes_in_extent as usize;
+                    remaining_bytes_to_write -= bytes_in_extent as usize;
+                    // Update current data index
+                    current_data_index = end_data_index;
                     // And then continue the loop over extents
                 }
             } else {
@@ -634,36 +639,42 @@ impl FuseFS {
                 remaining_blocks_to_offset -= ex_size;
             }
         };
-        if remaining_bytes_to_write.len() == 0 {
+        if remaining_bytes_to_write == 0 {
             // TODO: Should we return bytes written here or just return () like write_dir?
+            // update attributes
             return Ok(bytes_written as u64)
         };
         // If we still have bytes to write, we'll need to add more extents
-        let extra_bytes_needed = remaining_bytes_to_write.len();
+        let extra_bytes_needed = remaining_bytes_to_write;
         let new_extents = match self.allocate_blocks(extra_bytes_needed) {
             Some(exs) => exs,
             None => return Err(Errno::ENOSPC),
         };
         for ex in &new_extents {
-            // NOTE: This is the same code as in the second if-block earlier.
             let ex_size = ex.1;
+            // In this case, we've already passed the offset block and are
+            // in the write section
             let ex_start_byte_i = ex.0 * self.meta.superblock.block_size as u64;
             let bytes_in_extent = ex_size * self.meta.superblock.block_size as u64;
-            if bytes_in_extent >= remaining_bytes_to_write.len() as u64 {
+            if bytes_in_extent >= remaining_bytes_to_write as u64 {
                 // We can complete the write in this extent
-                self.store_fd.write_at(&mut remaining_bytes_to_write[..], ex_start_byte_i);
-                remaining_bytes_to_write = &remaining_bytes_to_write[bytes_in_extent as usize..].to_vec();
+                self.store_fd.write_at(
+                    &data[current_data_index..],
+                    ex_start_byte_i)?;
+                bytes_written += remaining_bytes_to_write;
                 // Increase number of bytes written and break from loop
-                bytes_written += remaining_bytes_to_write.len();
                 break
             } else {
                 // Cannot complete write in this extent
+                let end_data_index = current_data_index + bytes_in_extent as usize;
                 self.store_fd.write_at(
-                    &mut remaining_bytes_to_write[..bytes_in_extent as usize],
-                    ex_start_byte_i);
-                remaining_bytes_to_write = &remaining_bytes_to_write[bytes_in_extent as usize..].to_vec();
-                // Increase number of bytes written
+                    &data[current_data_index..end_data_index as usize],
+                    ex_start_byte_i)?;
+                // Update counters for bytes written and remaining bytes to write
                 bytes_written += bytes_in_extent as usize;
+                remaining_bytes_to_write -= bytes_in_extent as usize;
+                // Update current data index
+                current_data_index = end_data_index;
                 // And then continue the loop over extents
             }
         }
@@ -721,12 +732,12 @@ impl FuseFS {
                 if bytes_left_in_extent >= remaining_bytes {
                     // We can complete the read in this extent
                     let mut buf = vec![0u8; remaining_bytes as usize];
-                    self.store_fd.read_at(&mut buf, offset_byte_i);
+                    self.store_fd.read_at(&mut buf, offset_byte_i)?;
                     data_bytes.extend(&buf);
                     break
                 } else {
                     let mut buf = vec![0u8; bytes_left_in_extent as usize];
-                    self.store_fd.read_at(&mut buf, offset_byte_i);
+                    self.store_fd.read_at(&mut buf, offset_byte_i)?;
                     data_bytes.extend(&buf);
                     // Decrease remaining bytes
                     remaining_bytes -= bytes_left_in_extent;
@@ -740,12 +751,12 @@ impl FuseFS {
                 if bytes_in_extent >= remaining_bytes {
                     // We can complete the read in this extent
                     let mut buf = vec![0u8; remaining_bytes as usize];
-                    self.store_fd.read_at(&mut buf, ex_start_byte_i);
+                    self.store_fd.read_at(&mut buf, ex_start_byte_i)?;
                     data_bytes.extend(&buf);
                     break
                 } else {
                     let mut buf = vec![0u8; bytes_in_extent as usize];
-                    self.store_fd.read_at(&mut buf, ex_start_byte_i);
+                    self.store_fd.read_at(&mut buf, ex_start_byte_i)?;
                     data_bytes.extend(&buf);
                     // Decrease remaining bytes
                     remaining_bytes -= bytes_in_extent;
@@ -979,14 +990,14 @@ impl Filesystem for FuseFS {
         &self,
         _req: &Request,
         ino: INodeNo,
-        mode: Option<u32>,
-        uid: Option<u32>,
-        gid: Option<u32>,
-        size: Option<u64>,
+        _mode: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        _size: Option<u64>,
         _atime: Option<TimeOrNow>,
         _mtime: Option<TimeOrNow>,
         _ctime: Option<SystemTime>,
-        fh: Option<FileHandle>,
+        _fh: Option<FileHandle>,
         _crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
