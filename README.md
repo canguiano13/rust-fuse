@@ -67,9 +67,3 @@ rm /tmp/mnt/hello.txt
 ```bash
 fusermount -u /tmp/mnt
 ```
-
-## journalFS
-An extension of minimalFS with journaling for a form of crash-recovery/consistency.
-
-## mulcoreFS
-A partial rewrite of minimalFS/journalFS that aims to use SIM Commutativity principles to guide multicore scalable design.
