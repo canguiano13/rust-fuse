@@ -9,13 +9,13 @@ This filesystem is implemented as a FUSE userspace daemon. When a user applicati
 
 ## minimalFS
 The first filesystem is an extremely minimal implementation in the style of vsfs (from OSTEP). The following design choices are made:
+- Simulate contiguous block storage by allocating a single large file (using the OS filesystem) to act as the backing store for the entire FUSE filesystem.
 - Everything is stored on disk in that single large file, with the following structure: [superblock|inode-bitmap|data-bitmap|inode-table|data-region].
 - The inode table is stored as a flat array, with indices denoting inode number.
 - Use a list of extents to track data blocks for specific inodes.
 - Use fixed size bitmaps to store free/allocated metadata for both inodes and data blocks.
 - Extremely minimal access control: only mode bits and UID/GID.
 - No support for xattrs.
-- Not thread-safe.
 
 ### Supported Operations
 - `create` — create a new file
@@ -64,9 +64,12 @@ ln /tmp/mnt/hello.txt /tmp/mnt/hello_hard.txt
 rm /tmp/mnt/hello.txt
 ```
 ### Unmounting
+```bash
 fusermount -u /tmp/mnt
+```
 
 ## journalFS
 An extension of minimalFS with journaling for a form of crash-recovery/consistency.
 
 ## mulcoreFS
+A partial rewrite of minimalFS/journalFS that aims to use SIM Commutativity principles to guide multicore scalable design.
