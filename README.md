@@ -31,7 +31,7 @@ The first filesystem is an extremely minimal implementation in the style of vsfs
 ```bash
 git clone 
 cd rust-fuse
-cargo build --release
+cargo build
 ```
 
 ### Mounting the Filesystem
