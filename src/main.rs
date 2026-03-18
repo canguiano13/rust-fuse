@@ -1,25 +1,29 @@
 use std::fs::File;
 use std::io;
-use std::io::prelude::*;
+use std::io::Error;
+use std::collections::BTreeMap;
+use std::ffi::OsStr;
+// use std::os::unix::ffi::OsStrExt;
 use std::io::ErrorKind;
 use std::io::BufReader;
 use std::io::BufRead;
 use std::path::PathBuf;
 use std::path::Path;
-use bitmaps::Bitmap;
 use std::os::unix::fs::FileExt;
-use clap::Parser;
-use std::ffi::OsStr;
-use std::collections::HashMap;
+use std::fs::OpenOptions;
+use std::time::Duration;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 use std::sync::RwLock;
-use std::mem::size_of;
-use fuser::WriteFlags;
 
 use log::LevelFilter;
 use log::debug;
 use log::error;
 use log::info;
 // use log::warn;
+
+use clap::Parser;
+use bitmaps::Bitmap;
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -31,46 +35,34 @@ use fuser::Request;
 use fuser::INodeNo;
 use fuser::FileHandle;
 use fuser::OpenFlags;
+use fuser::WriteFlags;
 use fuser::LockOwner;
 use fuser::ReplyData;
 use fuser::Config;
 use fuser::Errno;
-use fuser::ReplyEmpty;
-use fuser::ReplyEntry;
+use fuser::TimeOrNow;
 
 const FSID: u32 = 0x55555;
+const META_FILE_NAME: &str = "meta.fs";
+const STORE_FILE_NAME: &str = "store.fs";
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
 struct Superblock {
     // Magic number identifying the file system.
     fsid: u32,
     // Block size in bytes.
     block_size: u32,
-    num_blocks: u64,
     num_inodes: u64,
-    // Start location of the first bitmap.
-    bitmap_start: u64,
-    // Start location of the inode table.
-    itable_start: u64,
-    // Start location of the data blocks.
-    data_start: u64,
+    num_blocks: u64,
 }
 
 impl Superblock {
     fn new(block_size: u32, num_inodes: u64, num_blocks: u64) -> Superblock {
-        // Use std::mem.size_of to get an aligned size calculation.
-        let sb_size = size_of::<Superblock>() as u64;
-        let it_start = sb_size + (num_inodes / 8) + (num_blocks / 8);
-        let da_start = it_start + (size_of::<InodeAttributes>() as u64) * num_inodes;
         Superblock {
             fsid: FSID,
             block_size,
             num_inodes,
             num_blocks,
-            bitmap_start: sb_size,
-            // We divide by 8 since addresses (basically pointers to locations
-            // in a file) are in terms of bytes (not bits).
-            itable_start: it_start,
-            data_start: da_start,
         }
     }
 }
@@ -78,8 +70,7 @@ impl Superblock {
 // The first value is the start location; the second value is the extent length.
 type Extent = (u64, u64);
 
-// TODO: Why does simple.rs use FileKind and not just fuser::FileType? Should
-// we continue to do this?
+// NOTE: Only support three basic kinds of files.
 #[derive(Serialize, Deserialize, Copy, Clone, PartialEq, Default, Debug)]
 enum FileKind {
     #[default]
@@ -88,7 +79,68 @@ enum FileKind {
     Symlink,
 }
 
-#[derive(Serialize, Deserialize, Default, Clone)]
+impl From<FileKind> for fuser::FileType {
+    fn from(kind: FileKind) -> Self {
+        match kind {
+            FileKind::File => fuser::FileType::RegularFile,
+            FileKind::Directory => fuser::FileType::Directory,
+            FileKind::Symlink => fuser::FileType::Symlink,
+        }
+    }
+}
+
+// Small helper to convert standard Linux "mode" integers into the filetypes
+// they represent, at least for the 3 filetypes we implement.
+// NOTE: Why do all these lower-level systems use all these magic numbers...we
+// should be able to pass real types around lol.
+fn as_file_kind(mut mode: u32) -> FileKind {
+    mode &= libc::S_IFMT as u32;
+
+    if mode == libc::S_IFREG as u32 {
+        return FileKind::File;
+    } else if mode == libc::S_IFLNK as u32 {
+        return FileKind::Symlink;
+    } else if mode == libc::S_IFDIR as u32 {
+        return FileKind::Directory;
+    }
+    unimplemented!("{mode}");
+}
+
+// Helper to calculate the GID of a created file under a parent directory.
+fn creation_gid(parent: &InodeAttributes, gid: u32) -> u32 {
+    if parent.mode & libc::S_ISGID as u16 != 0 {
+        return parent.gid;
+    }
+    gid
+}
+
+// Some helper functions for time.
+// =============================================================================
+fn time_now() -> (i64, u32) {
+    time_from_system_time(&SystemTime::now())
+}
+
+fn system_time_from_time(secs: i64, nsecs: u32) -> SystemTime {
+    if secs >= 0 {
+        UNIX_EPOCH + Duration::new(secs as u64, nsecs)
+    } else {
+        UNIX_EPOCH - Duration::new((-secs) as u64, nsecs)
+    }
+}
+
+fn time_from_system_time(system_time: &SystemTime) -> (i64, u32) {
+    // Convert to signed 64-bit time with epoch at 0
+    match system_time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => (duration.as_secs() as i64, duration.subsec_nanos()),
+        Err(before_epoch_error) => (
+            -(before_epoch_error.duration().as_secs() as i64),
+            before_epoch_error.duration().subsec_nanos(),
+        ),
+    }
+}
+// =============================================================================
+
+#[derive(Serialize, Deserialize, Default, Clone, Debug)]
 struct InodeAttributes {
     pub inode: u64,
     // Ref count of open file handles to this inode
@@ -103,424 +155,916 @@ struct InodeAttributes {
     pub hardlinks: u32,
     pub uid: u32,
     pub gid: u32,
-    // A fixed array for extents.
-    pub extent_index: [Extent; 8],
-    // A pointer to the location of an indirect block of extents (if needed).
-    pub extent_indirect: u64,
+    // NOTE: Giving up on fixed array for extents, and fixed metadata size in
+    // general (for ease-of-implementation). This no longer corresponds to the
+    // design of vsfs in OSTEP.
+    pub extent_index: Vec<Extent>,
 }
 
 // Table (flat data structure: a vector) with inodes.
 type InodeTable = RwLock<Vec<InodeAttributes>>;
 
-struct FuseFS {
+#[derive(Serialize, Deserialize)]
+struct MetaSerializable {
     superblock: Superblock,
-    inode_bitmap: RwLock<Vec<Bitmap<1024>>>,
-    data_bitmap: RwLock<Vec<Bitmap<1024>>>,
+    // NOTE: It would actually be great to have a u8 vec for higher data density,
+    // but I'm really strapped for time and don't want to deal with even the
+    // minor complexity of conversion from bits to u8. So bools it is!
+    // TODO: You should really make a u8 vec; metadata size is a bit crazy
+    // right now lol.
+    inode_bitmap: Vec<bool>,
+    data_bitmap: Vec<bool>,
     inode_table: InodeTable,
-    block_store_fd: File,
-    dir_entries: RwLock<HashMap<u64, Vec<(u64, String)>>>,
+}
+
+impl MetaSerializable {
+    fn to_meta(&self) -> Meta {
+        let inode_bitmap_len = usize::try_from(self.superblock.num_inodes / 1024).unwrap();
+        let mut inode_bitmap = vec![Bitmap::<1024>::new(); inode_bitmap_len];
+        for (i, bit) in self.inode_bitmap.iter().enumerate() {
+            if *bit {
+                let chunk_index = i / 1024;
+                let bit_index = i % 1024;
+                // Set bit in the actual bitmap
+                inode_bitmap[chunk_index].set(bit_index, true);
+            }
+        };
+        let data_bitmap_len = usize::try_from(self.superblock.num_blocks / 1024).unwrap();
+        let mut data_bitmap = vec![Bitmap::<1024>::new(); data_bitmap_len];
+        for (i, bit) in self.data_bitmap.iter().enumerate() {
+            if *bit {
+                let chunk_index = i / 1024;
+                let bit_index = i % 1024;
+                // Set bit in the actual bitmap
+                data_bitmap[chunk_index].set(bit_index, true);
+            }
+        };
+        Meta {
+            superblock: self.superblock.clone(),
+            inode_bitmap: RwLock::new(inode_bitmap.clone()),
+            data_bitmap: RwLock::new(data_bitmap.clone()),
+            inode_table: RwLock::new(self.inode_table.clone()),
+        }
+    }
+}
+
+const BITMAP_CHUNK_BITS: usize  = 1024;
+
+struct Meta {
+    superblock: Superblock,
+    inode_bitmap: RwLock<Vec<Bitmap<BITMAP_CHUNK_BITS>>>,
+    data_bitmap: RwLock<Vec<Bitmap<BITMAP_CHUNK_BITS>>>,
+    inode_table: RwLock<InodeTable>,
+}
+
+impl Meta {
+    fn to_meta_serializable(&self) -> MetaSerializable {
+        let mut inode_bmap_bool: Vec<bool> = Vec::new();
+        let inode_bitmap_binding = self.inode_bitmap.read().unwrap();
+        for chunk in inode_bitmap_binding.iter() {
+            for i in 0..BITMAP_CHUNK_BITS {
+                if chunk.get(usize::try_from(i).unwrap()) {
+                    inode_bmap_bool.push(true)
+                } else {
+                    inode_bmap_bool.push(false)
+                }
+            }
+        };
+        let mut data_bmap_bool: Vec<bool> = Vec::new();
+        let data_bitmap_binding = self.data_bitmap.read().unwrap();
+        for chunk in data_bitmap_binding.iter() {
+            for i in 0..BITMAP_CHUNK_BITS {
+                if chunk.get(usize::try_from(i).unwrap()) {
+                    data_bmap_bool.push(true)
+                } else {
+                    data_bmap_bool.push(false)
+                }
+            }
+        };
+        MetaSerializable {
+            superblock: self.superblock.clone(),
+            inode_bitmap: inode_bmap_bool,
+            data_bitmap: data_bmap_bool,
+            inode_table: self.inode_table.read().unwrap().clone(),
+        }
+    }
+}
+
+// A B-tree map relating file name to a tuple of (inode number, file kind).
+type DirectoryEntries = BTreeMap<String, (u64, FileKind)>;
+
+struct FuseFS {
+    // fs_dir: PathBuf,
+    meta: Meta,
+    meta_fd: File,
+    store_fd: File,
 }
 
 // Implement methods specific to FuseFS design and structure.
 impl FuseFS {
-    // TODO: Use PathBuf here instead of string.
-    // TODO: Am I supposed to have a dedicated Error component to the Result type?
-    fn new(fd: File, block_size: u32, num_inodes: u64, num_blocks: u64) -> FuseFS {
-        debug!("Creating filesystem..");
-        let superblock = Superblock::new(block_size, num_inodes, num_blocks);
-        // TODO: Check if this syntax actually does what you want it to do.
-        let inode_bitmap = RwLock::new(vec![Bitmap::<1024>::new(); num_inodes as usize / 1024]);
-        let data_bitmap = RwLock::new(vec![Bitmap::<1024>::new(); num_blocks as usize / 1024]);
-        let inode_table = RwLock::new(vec![InodeAttributes::default(); num_inodes as usize]);
-        FuseFS {
-            superblock,
-            inode_bitmap,
-            data_bitmap,
-            inode_table,
-            block_store_fd: fd,
-            dir_entries: RwLock::new(HashMap::new()),
-        }
-    }
+    fn new(fs_dir_path: PathBuf,
+           block_size: u32,
+           num_inodes: u64,
+           num_blocks: u64
+    ) -> Result<FuseFS, Error> {
+        info!("Creating filesystem..");
+        // Construct paths to expected files
+        let mut meta_file_path: PathBuf = fs_dir_path.clone();
+        meta_file_path.push(Path::new(META_FILE_NAME));
+        let mut store_file_path: PathBuf = fs_dir_path.clone();
+        store_file_path.push(Path::new(STORE_FILE_NAME));
 
-    // TODO: Do this stuff after we get space allocation and serialization and
-    // deserialization figured out. OK, or just figure out some of the basic
-    // serialization/deserialization stuff to get this working.
-    fn load(mut fd: File) -> FuseFS {
-        // Read file superblock
-        let mut sb_buf = [0; size_of::<Superblock>()];
-        let _ = match fd.read(&mut sb_buf) {
-            Ok(n) => n,
-            Err(e) => panic!("could not read from backing file with error: {}", e),
-        };
-        // Read in all data needed to re-create the filesystem
-        // Return the loaded filesystem; crash if ill-formatted
-
-        // Temporary stub until deserialization is implemented
-        FuseFS::new(fd, 4096, 32768, 32768)
-    }
-
-    // search for next free space in the inode table using bitmap
-    // if space is available, return the offset of the free block from the start of data region
-    // return None if there is no space in the data region
-    fn next_free_inode(&self) -> Option<u64> { 
-        let bit_per_chunk = 1024;
-
-        let inode_bitmap_binding = self.inode_bitmap.read().unwrap();
-        // search one bitmap chunk at a time
-        for (chunk_idx, chunk) in inode_bitmap_binding.iter().enumerate(){
-            // check each bit until we find a free space
-            let mut i = 0;
-            while i < bit_per_chunk && chunk.get(i){
-                i += 1
-            }
-
-            // check that it's actually free and not that the entire chunk is allocated
-            if i < bit_per_chunk{
-                return Some(((chunk_idx * bit_per_chunk) + i) as u64);
-            }
-        }
-
-        //no free spots
-        return None;
-    }
-
-    // search for next free space in the data region using bitmap
-    // if space is available, return the offset of the free block from the start of data region
-    // return None if there is no space in the data region
-    fn next_free_block(&self) -> Option<u64> { 
-        let bit_per_chunk = 1024;
-
-
-        // search bitmap one chunk at a time
-        let data_bitmap_binding = self.data_bitmap.read().unwrap();
-        for (chunk_idx, chunk) in data_bitmap_binding.iter().enumerate(){
-            // check each bit until we find a free space
-            let mut i = 0;
-            while i < bit_per_chunk && chunk.get(i){
-                i += 1
-            }
-
-            // check that it's actually free and not that the entire chunk is allocated
-            if i < bit_per_chunk{
-                return Some(((chunk_idx * bit_per_chunk) + i) as u64);
-            }
-        }
-
-        //no free spots
-        return None;
-    }
-
-    // allocate an inode basd on available space in the inode table
-    fn allocate_inode(&self) -> Option<u64>{
-        // get the index of the next free inode
-        let free_idx = self.next_free_inode();
-
-        if let Some(idx) = free_idx{
-            let chunk = (idx / 1024) as usize; // compiler doesn't like it without casting for some reason??
-            let bit = (idx % 1024) as usize;
-
-            // mark inode bitmap slot as allocated
-            let mut bitmap_binding = self.inode_bitmap.write().unwrap();
-            let bitmap_chunk = match bitmap_binding.get_mut(chunk){
-                Some(slot) => slot,
-                None => return None
+        // If the filesystem backing files already exist, load in existing
+        // metadata. Otherwise, initialize new defaults.
+        let meta = if meta_file_path.exists() && store_file_path.exists() {
+            info!("Loading existing filesystem...");
+            let fd = File::open(&meta_file_path)?;
+            let reader = BufReader::new(fd);
+            // Update metadata with existing information from file.
+            let meta_ser: MetaSerializable = match serde_json::from_reader(reader) {
+                Ok(m) => m,
+                Err(e) => return Err(Error::new(ErrorKind::InvalidData, e)),
             };
-            bitmap_chunk.set(bit, true);
-
-            // return the location that the data was allocated at
-            return Some(idx);
-
-        } else{
-            // no free space available in inode table
-            return None
-        }
-    }
-
-    // allocate data block based on available space in the data region
-    fn allocate_block(&self) -> Option<u64>{
-        // get the index of the next free data block 
-        let free_idx = self.next_free_block();
-
-        if let Some(idx) = free_idx{
-            // mark it as allocated
-            let chunk = (idx / 1024) as usize; 
-            let bit = (idx % 1024) as usize;
-
-            let mut bitmap_binding = self.data_bitmap.write().unwrap();
-            let bitmap_chunk = match bitmap_binding.get_mut(chunk){
-                Some(slot) => slot,
-                None => return None
-            };
-            
-            bitmap_chunk.set(bit, true);
-
-            // return the location that the data was allocated at
-            return Some(idx);
-
-        } else{
-            // no free space available in data region
-            return None
-        }
-    }
-
-    //clear the bitmap bit for a space in the inode table
-    fn free_inode(&self, inode_idx: u64){
-        let chunk = (inode_idx / 1024) as usize; 
-        let bit = (inode_idx % 1024) as usize;
-
-        //bitmap structure uses chunks of 1024 bits
-        let inodes_per_bitmap_chunk = 1024usize;
-
-        //dont deallocate anyhing out of bounds
-        if chunk >= (self.superblock.num_inodes as usize / inodes_per_bitmap_chunk){
-            debug!("couldn't free out of bounds chunk from inode table");
-            return; 
-        } 
-
-        //get inode bitmap chunk
-        let mut inode_bitmap_binding = self.inode_bitmap.write().unwrap();
-        let bitmap_chunk = match inode_bitmap_binding.get_mut(chunk){
-            Some(slot) => slot,
-            None => {
-                debug!("couldn't free bit in inode bitmap");
-                return;
+            meta_ser.to_meta()
+        } else {
+            info!("Creating new filesystem...");
+            Meta {
+                superblock: Superblock::new(block_size, num_inodes, num_blocks),
+                // TODO: Check if this syntax actually does what you want it to do.
+                inode_bitmap: RwLock::new(
+                    vec![Bitmap::<BITMAP_CHUNK_BITS>::new(); num_inodes as usize / BITMAP_CHUNK_BITS]),
+                data_bitmap: RwLock::new(
+                    vec![Bitmap::<BITMAP_CHUNK_BITS>::new(); num_blocks as usize / BITMAP_CHUNK_BITS]),
+                inode_table: RwLock::new(vec![InodeAttributes::default(); num_inodes as usize]),
             }
         };
+        // Open corresponding filesystem backing files; this will open the files
+        // if they already exist, or create new files if they don't.
+        let meta_fd = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .read(true)
+            .open(meta_file_path)?;
+        let store_fd = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .read(true)
+            .open(store_file_path)?;
+        // Statically allocate the maximum size for the filesystem:
+        // num_blocks * block_size.
+        let max_size = num_inodes * block_size as u64;
+        store_fd.set_len(max_size)?;
 
-
-        //clear bit in inode bitmap
-        bitmap_chunk.set(bit, false);
-        return 
+        info!("Created filesystem.");
+        Ok(FuseFS {
+            // fs_dir: fs_dir_path,
+            meta,
+            meta_fd,
+            store_fd,
+        })
     }
 
-    //clear the data bitmap bit for some space in the data region
-    fn free_block(&self, block_idx: u64){
-        let chunk = (block_idx / 1024) as usize; 
-        let bit = (block_idx % 1024) as usize;
+    // Calculate creation mode from some u32 mode (NOTE: I actually don't know
+    // what this does exactly, but it's taken from the fuser examples simple.rs
+    // program and seems to work).
+    fn creation_mode(&self, mode: u32) -> u16 {
+        (mode & !(libc::S_ISUID | libc::S_ISGID) as u32) as u16
+    }
 
-        let blocks_per_bitmap_chunk= 1024usize;
+    // NOTE: This just panics if something goes wrong. Should be fine, since
+    // we will probably only call this when shutting down the filesystem. Also,
+    // I'm lazy. Maybe you should handle errors nicely at some point.
+    fn flush_meta(&self) {
+        let meta_ser = self.meta.to_meta_serializable();
+        // Small hack to zero the file so we actually overwrite everything.
+        self.meta_fd.set_len(0).unwrap();
+        // TODO: Should really use rkyv and not serde_json for higher data density.
+        // Right now, the size of your metadata is pretty insane (due to JSON
+        // encoding overhead, I presume).
+        serde_json::to_writer(&self.meta_fd, &meta_ser).unwrap();
+    }
 
-        //dont deallocate anyhing out of bounds
-        if chunk >= (self.superblock.num_blocks as usize / blocks_per_bitmap_chunk){
-            debug!("chunk out of bounds, couldn't free data bitmap chunk");
-            return
-        }
-
-        //get data bitmap chunk
-        let mut data_bitmap_binding = self.data_bitmap.write().unwrap();
-        let bitmap_chunk = match data_bitmap_binding.get_mut(chunk){
-            Some(slot) => slot,
-            None => {
-                debug!("couldn't free bit in data bitmap");
-                return
+    // If an inode is available, set the inode bit and return the offset of the
+    // free block from the start of data region. Otherwise, do nothing and return
+    // None. We currently just use a simple linear search.
+    // NOTE (side-effect): This function may change inode bitmap state.
+    fn allocate_inode(&self) -> Option<INodeNo> {
+        let mut inode_bitmap_binding = self.meta.inode_bitmap.write().unwrap();
+        for (chunk_idx, chunk) in inode_bitmap_binding.iter().enumerate() {
+            // check each bit until we find a free space, skipping index 0
+            // NOTE: inode 0 is just not allowed in Linux filesystems it seems,
+            // so avoid ever allocating it and just keep it false/empty in the
+            // bitmap. inode 1 is reserved as the root inode. This should not
+            // be a problem in practice because it is allocated on init and
+            // never deallocated, but we also skip it here for completeness.
+            match chunk.next_false_index(1) {
+                Some(i) => {
+                    inode_bitmap_binding[chunk_idx].set(i, true);
+                    // Wrap in INodeNo (which fuser provides)
+                    return Some(INodeNo(((chunk_idx * BITMAP_CHUNK_BITS) + i) as u64));
+                },
+                None => continue,
             }
         };
-
-        //clear bit in data bitmap
-        bitmap_chunk.set(bit, false);
-        return;
+        return None
     }
 
-    //number of blocks allocated for file 
-    fn blocks_allocated(&self, inode_size: u64) -> u64{
-        return (inode_size + self.superblock.block_size as u64 - 1) / self.superblock.block_size as u64
+    fn free_inode(&self, inode: INodeNo) {
+        let chunk_idx = inode.0 as usize / BITMAP_CHUNK_BITS;
+        let bit_idx = inode.0 as usize % BITMAP_CHUNK_BITS;
+        let mut inode_bitmap_binding = self.meta.inode_bitmap.write().unwrap();
+        inode_bitmap_binding[chunk_idx].set(bit_idx, false);
     }
 
-    //calculate offset into data region for given block
-    fn offset_from_block_idx(&self, block_idx: u64) -> u64{
-       return self.superblock.data_start + (block_idx * self.superblock.block_size as u64);
+    fn set_inode_attr(&self, inode: INodeNo, attr: InodeAttributes) {
+        self.meta.inode_table.write().unwrap()[inode.0 as usize] = attr;
     }
 
-    //store inode in inode table at inode_idx
-    fn set_inode_table(&self, inode_idx: u64, data: InodeAttributes){
-        if let Some(ino) = self.inode_table.write().unwrap().get_mut(inode_idx as usize){
-            *ino = data.clone();
-        }
-        // persist to disk
-        if let Err(e) = self.write_inode(inode_idx, &data) {
-            error!("failed to write inode {} to disk: {}", inode_idx, e);
-        }
-    }
-
-    //find a entry in a directory
-    fn find_dir_entry(&self, parent: u64, target_name: &OsStr) -> Option<u64>{
-        //get files in directory based on directory inode number
-        let binding = self.dir_entries.read().unwrap();
-        let entries = binding.get(&parent);
-
-        //search through directory entries for target file
-        if let Some(entries) = entries {
-            for (inode_number, entry_name) in entries.iter(){
-                if entry_name.as_str() == target_name.to_string_lossy().as_ref(){
-                    return Some(*inode_number);
+    fn get_inode_attr(&self, inode: INodeNo) -> Result<InodeAttributes, Errno> {
+        let chunk = inode.0 as usize / BITMAP_CHUNK_BITS;
+        let bit = inode.0 as usize % BITMAP_CHUNK_BITS;
+        // Check if inode is actually allocated in the bitmap
+        match self.meta.inode_bitmap.read().unwrap().get(chunk) {
+            None => {
+                return Err(Errno::ENOENT)
+            }
+            Some(bitmap) => {
+                if !bitmap.get(bit) {
+                    return Err(Errno::ENOENT);
                 }
             }
         }
-
-        return None;
+        // If it is, get inode attributes from the inode table
+        let itable = self.meta.inode_table.read().unwrap();
+        Ok(itable[inode.0 as usize].clone())
     }
 
-    fn decrement_links(&self,inode_no: u64) -> Option<(u32, [Extent; 8])>{
-      //get the inode from the inode table
-        let mut inode_table_binding = self.inode_table.write().unwrap();
-        let inode = match inode_table_binding.get_mut(inode_no as usize){
-            Some(ino) => ino,
-            None => return None
+    // Number of blocks allocated for file
+    fn blocks_allocated(&self, size: u64) -> u64 {
+        return size.div_ceil(u64::from(self.meta.superblock.block_size as u64))
+    }
+
+    // Helper to convert InodeAttributes to FileAttr
+    fn inode_attr_to_file_attr(&self, i: &InodeAttributes) -> fuser::FileAttr {
+        fuser::FileAttr {
+            ino: INodeNo(i.inode),
+            size: i.size,
+            blocks: i.size.div_ceil(u64::from(self.meta.superblock.block_size as u64)),
+            atime: system_time_from_time(i.last_accessed.0, i.last_accessed.1),
+            mtime: system_time_from_time(i.last_modified.0, i.last_modified.1),
+            ctime: system_time_from_time(i.last_metadata_changed.0, i.last_metadata_changed.1),
+            crtime: std::time::UNIX_EPOCH,
+            kind: i.kind.into(),
+            perm: i.mode,
+            nlink: i.hardlinks,
+            uid: i.uid,
+            gid: i.gid,
+            rdev: 0,
+            blksize: self.meta.superblock.block_size,
+            flags: 0,
+        }
+    }
+
+    // If space is available of the desired size, allocate that space by setting
+    // all corresponding data bitmap bits and return the associatd extent(s).
+    // Otherwise, return None.
+    // NOTE (side-effect): This function may change data bitmap state.
+    fn allocate_blocks(&self, size: usize) -> Option<Vec<Extent>> {
+        // Return immediately with empty extent vector if size is 0
+        if size == 0 {
+            return Some(vec![])
+        };
+        let mut num_blocks_needed = size / (self.meta.superblock.block_size as usize) + 1;
+        let mut extents: Vec<Extent> = Vec::new();
+        // Find list of extents with total desired size
+        let mut data_bitmap_binding = self.meta.data_bitmap.write().unwrap();
+        for (chunk_idx, chunk) in data_bitmap_binding.iter().enumerate() {
+            let base_offset = chunk_idx * BITMAP_CHUNK_BITS;
+            let mut ex_open: usize;
+            let mut ex_size: usize = 0;
+            // check each bit until we find a free space
+            // Assertion here should be that num_blocks_needed > 0
+            ex_open = match chunk.first_false_index() {
+                Some(i) => {
+                    // Decrement number of blocks needed
+                    num_blocks_needed -= 1;
+                    // Add to extent size
+                    ex_size += 1;
+                    i
+                },
+                None => continue,
+            };
+            loop {
+                let next_filled_i = match chunk.next_index(ex_open) {
+                    Some(i) => i,
+                    // A bit weird, but we want to re-use the logic below. If
+                    // there is no next 'true' bit, then we are free until the
+                    // very end of the chunk, and we want to loop all the way
+                    // up until the very last bit in the chunk.
+                    None => BITMAP_CHUNK_BITS + 1,
+                };
+                let free_size = next_filled_i - ex_open;
+                if free_size > num_blocks_needed {
+                    // NOTE: At this point, we know that we have found enough
+                    // space for the full allocation.
+                    ex_size += num_blocks_needed;
+                    extents.push(((base_offset + ex_open) as u64, ex_size as u64));
+                    // Only actually allocate/set inode bits when we definitely
+                    // have enough space for the full allocation.
+                    for ex in &extents {
+                        let open = ex.0;
+                        let size = ex.1;
+                        let chunk_idx = open as usize / BITMAP_CHUNK_BITS;
+                        let bit_offset_open = open as usize % BITMAP_CHUNK_BITS;
+                        for i in bit_offset_open..(bit_offset_open + size as usize) {
+                            data_bitmap_binding[chunk_idx].set(i as usize, true);
+                        }
+                    }
+                    return Some(extents)
+                } else {
+                    // Allocate next free section of blocks to our extent.
+                    ex_size += free_size;
+                    // Decrease number of free blocks still needed accordingly.
+                    num_blocks_needed -= free_size;
+                    extents.push(((base_offset + ex_open) as u64, ex_size as u64));
+                }
+                ex_open = match chunk.next_false_index(ex_open + ex_size) {
+                    // If we still have free blocks left in the current chunk,
+                    // set the new initial extent offset to the next free block
+                    // and continue the loop in the current chunk.
+                    Some(i) => {
+                        // Reset extent size. NOTE: this code is truly horrible.
+                        ex_size = 1;
+                        num_blocks_needed -= 1;
+                        i
+                    },
+                    // If we're out of free blocks in the current chunk, break
+                    // out of this loop and go to the next chunk (in the outer
+                    // for-loop).
+                    None => break,
+                };
+            }
+        };
+        return None
+    }
+
+    fn free_blocks() {
+
+    }
+
+    fn read_extent(&self, ex: &Extent) -> Result<Vec<u8>, Errno> {
+        let start_byte = ex.0 * self.meta.superblock.block_size as u64;
+        let extent_size_bytes = ex.1 * self.meta.superblock.block_size as u64;
+        // Read specified chunk of file using read_at
+        // NOTE: read_at is specific to Unix systems, so this means, of course,
+        // that our implementation will only work on Unix systems.
+        let mut buf: Vec<u8> = vec![0u8; extent_size_bytes as usize];
+        let _read_bytes = self.store_fd.read_at(&mut buf, start_byte)?;
+        Ok(buf)
+    }
+
+    fn write_extent(&self, ex: &Extent, data: Vec<u8>) -> Result<Vec<u8>, Errno> {
+        let start_byte = ex.0 * self.meta.superblock.block_size as u64;
+        let extent_size_bytes = ex.1 * self.meta.superblock.block_size as u64;
+        self.store_fd.write_at(&data[..], start_byte)?;
+        // If there are more bytes in the data byte vector, return the remaining
+        // bytes for further processing. Otherwise, we've written all of our data
+        // and we return an empty byte vector signaling completion.
+        if data.len() > extent_size_bytes as usize {
+            Ok(data[extent_size_bytes as usize..].to_vec())
+        } else {
+            Ok(vec![])
+        }
+    }
+
+    // NOTE: None of this stuff is thread-safe (for now). Concurrent writes to
+    // a file are possible, and data may be corrupted.
+    // TODO: Write seems to overwriting from the start when we append?
+    // Or at least it's writing kind of weirdly...need to look into this.
+    fn write_file(&self, inode: INodeNo, offset: u64, data: &Vec<u8>) -> Result<u64, Errno> {
+        // Get inode attributes from inode table
+        let attr = match self.get_inode_attr(inode) {
+            Ok(i) => i,
+            Err(e) => return Err(e),
         };
 
-        let hardlinks = inode.hardlinks;
-        let extent_idx = inode.extent_index;
+        // Disallow the write if the offset is beyond the size of the file
+        if offset > attr.size {
+            return Err(Errno::EINVAL)
+        };
 
-        inode.hardlinks = hardlinks - 1;
+        // Compute mapping of offset and size to specific slices of file extents
+        // Compute index of block (within the file) that the offset starts in
+        let mut remaining_blocks_to_offset = offset / self.meta.superblock.block_size as u64;
+        // Compute byte index in the block (calculated above) that the offset starts at
+        let byte_in_offset_block = offset % self.meta.superblock.block_size as u64;
+        let mut bytes_written = 0;
+        // Compute mapping of offset and size of the data to specific slices
+        // file extents; we may need to add extents to the file.
+        // Write data to the slices of the extents
+        let mut remaining_bytes_to_write = data.len();
+        let mut current_data_index = 0;
+        for ex in &attr.extent_index {
+            // TODO: There might be an off-by-one error here, so watch out.
+            // Ideally write some tests for this, but time may not allow.
+            let ex_size = ex.1;
+            if ex_size > remaining_blocks_to_offset {
+                // In this case, we know that our offset is in this extent
+                let offset_block_i = ex.0 + remaining_blocks_to_offset;
+                let offset_byte_i =
+                    (offset_block_i * self.meta.superblock.block_size as u64)
+                    + byte_in_offset_block;
+                let bytes_left_in_extent =
+                    (ex_size - remaining_blocks_to_offset) * self.meta.superblock.block_size as u64
+                    - byte_in_offset_block;
+                // Set remaining blocks until offset to 0, since we've now found
+                // the offset block
+                remaining_blocks_to_offset = 0;
+                // Check if we can complete the write in this extent
+                if bytes_left_in_extent >= remaining_bytes_to_write as u64 {
+                    // We can complete the write in this extent
+                    self.store_fd.write_at(&data[current_data_index..], offset_byte_i)?;
+                    // Increase number of bytes written, set remaining bytes to
+                    // 0, and break from loop
+                    bytes_written += remaining_bytes_to_write;
+                    remaining_bytes_to_write = 0;
+                    break
+                } else {
+                    // Cannot complete write in this extent
+                    let end_data_index = current_data_index + bytes_left_in_extent as usize;
+                    self.store_fd.write_at(
+                        &data[current_data_index..end_data_index],
+                        offset_byte_i)?;
+                    // Update counters for bytes written and remaining bytes to write
+                    bytes_written += bytes_left_in_extent as usize;
+                    remaining_bytes_to_write -= bytes_left_in_extent as usize;
+                    // Update current data index
+                    current_data_index = end_data_index;
+                    // And then continue the loop over extents
+                }
+            } else if remaining_blocks_to_offset != 0 {
+                // In this case, we haven't yet found the offset block and we
+                // need to continue looking for it before we can start reading
+                // NOTE: At this point, we know that ex_size <= remaining_blocks_to_offset
+                // so we can mark this extent as covered --- decreasing the
+                // remaining blocks counter by its size (in blocks) --- and
+                // continuing with the loop.
+                remaining_blocks_to_offset -= ex_size;
+            } else {
+                // In this case, we've already passed the offset block and are
+                // in the write section
+                let ex_start_byte_i = ex.0 * self.meta.superblock.block_size as u64;
+                let bytes_in_extent = ex_size * self.meta.superblock.block_size as u64;
+                if bytes_in_extent >= remaining_bytes_to_write as u64 {
+                    // We can complete the write in this extent
+                    self.store_fd.write_at(
+                        &data[current_data_index..],
+                        ex_start_byte_i)?;
+                    bytes_written += remaining_bytes_to_write;
+                    remaining_bytes_to_write = 0;
+                    // Increase number of bytes written and break from loop
+                    break
+                } else {
+                    // Cannot complete write in this extent
+                    let end_data_index = current_data_index + bytes_in_extent as usize;
+                    self.store_fd.write_at(
+                        &data[current_data_index..end_data_index as usize],
+                        ex_start_byte_i)?;
+                    // Update counters for bytes written and remaining bytes to write
+                    bytes_written += bytes_in_extent as usize;
+                    remaining_bytes_to_write -= bytes_in_extent as usize;
+                    // Update current data index
+                    current_data_index = end_data_index;
+                    // And then continue the loop over extents
+                }
+            }
+        };
+        if remaining_bytes_to_write == 0 {
+            // Compute new size: if we're writing some data within the original
+            // size of the file, we don't want to update the overall size.
+            let write_max = offset + data.len() as u64;
+            let new_size = if write_max > attr.size {
+                write_max
+            } else {
+                attr.size
+            };
+            // Update attributes
+            let new_attr = InodeAttributes {
+                // Compute new size
+                size: new_size,
+                last_modified: time_now(),
+                last_metadata_changed: time_now(),
+                ..attr
+            };
+            self.set_inode_attr(inode, new_attr);
+            return Ok(bytes_written as u64)
+        };
+        // If we still have bytes to write, we'll need to add more extents
+        let new_extents = match self.allocate_blocks(remaining_bytes_to_write) {
+            Some(exs) => exs,
+            None => return Err(Errno::ENOSPC),
+        };
+        for ex in &new_extents {
+            let ex_size = ex.1;
+            // In this case, we've already passed the offset block and are
+            // in the write section
+            let ex_start_byte_i = ex.0 * self.meta.superblock.block_size as u64;
+            let bytes_in_extent = ex_size * self.meta.superblock.block_size as u64;
+            if bytes_in_extent >= remaining_bytes_to_write as u64 {
+                // We can complete the write in this extent
+                self.store_fd.write_at(
+                    &data[current_data_index..],
+                    ex_start_byte_i)?;
+                bytes_written += remaining_bytes_to_write;
+                // Increase number of bytes written and break from loop
+                break
+            } else {
+                // Cannot complete write in this extent
+                let end_data_index = current_data_index + bytes_in_extent as usize;
+                self.store_fd.write_at(
+                    &data[current_data_index..end_data_index as usize],
+                    ex_start_byte_i)?;
+                // Update counters for bytes written and remaining bytes to write
+                bytes_written += bytes_in_extent as usize;
+                remaining_bytes_to_write -= bytes_in_extent as usize;
+                // Update current data index
+                current_data_index = end_data_index;
+                // And then continue the loop over extents
+            }
+        }
+        // Merge old extents with new extents and add to attributes
+        let mut all_extents = attr.extent_index.clone();
+        all_extents.extend(new_extents);
 
-        return Some((hardlinks, extent_idx));
+        // Update metadata and return
+        let new_attr = InodeAttributes {
+            // Here, we know that we've definitely written past the old size,
+            // since we've allocated new extents, so we can safely just assign
+            // the max byte index of the write as the new size.
+            size: offset + data.len() as u64,
+            last_modified: time_now(),
+            last_metadata_changed: time_now(),
+            extent_index: all_extents,
+            ..attr
+        };
+        self.set_inode_attr(inode, new_attr);
+        return Ok(bytes_written as u64)
     }
 
-    fn write_inode(&self, inode_idx: u64, inode: &InodeAttributes) -> io::Result<()> {
-        // Convert to bytes using bincode
-        let bytes = bincode::serialize(inode)
-            .map_err(|e| io::Error::new(ErrorKind::Other, e))?;
-        
-        // Calculate where inode is written
-        let offset = self.superblock.itable_start 
-            + (inode_idx * size_of::<InodeAttributes>() as u64);
-        // Write at the correct location
-        self.block_store_fd.write_at(&bytes, offset)?;
-        Ok(())
+    fn read_file(&self, inode: INodeNo, offset: u64, size: u32) -> Result<Vec<u8>, Errno> {
+        // Get inode attributes from inode table
+        let attr = match self.get_inode_attr(inode) {
+            Ok(i) => i,
+            Err(e) => return Err(e),
+        };
+        if offset > attr.size {
+            return Err(Errno::EINVAL)
+        };
+        // Check if the read will go beyond the size of the file
+        // NOTE: It looks like the cat shell operation reads in chunks of 4096
+        // bytes by default on my machine, so we need to allow for cases where
+        // the size passed here isn't exactly within bounds.
+        let adjust_size = if offset + size as u64 > attr.size {
+            (attr.size - offset) as u32
+        } else {
+            size
+        };
+        // debug!("adjusted size: {:?}", adjust_size);
+
+        // Compute mapping of offset and size to specific slices of file extents
+        // Compute index of block (within the file) that the offset starts in
+        let mut remaining_blocks_to_offset = offset / self.meta.superblock.block_size as u64;
+        // Compute byte index in the block (calculated above) that the offset starts at
+        let byte_in_offset_block = offset % self.meta.superblock.block_size as u64;
+
+        // Store and track read data bytes
+        let mut data_bytes: Vec<u8> = Vec::new();
+        let mut remaining_bytes = adjust_size as u64;
+        // Loop through extents and read slices from extents that are in the
+        // section of the file to be read
+        for ex in &attr.extent_index {
+            // TODO: There might be an off-by-one error here, so watch out.
+            // Ideally write some tests for this, but time may not allow.
+            let ex_size = ex.1;
+            if ex_size > remaining_blocks_to_offset {
+                // In this case, we know that our offset is in this extent
+                let offset_block_i = ex.0 + remaining_blocks_to_offset;
+                let offset_byte_i =
+                    offset_block_i * self.meta.superblock.block_size as u64
+                    + byte_in_offset_block;
+                let bytes_left_in_extent =
+                    (ex_size - remaining_blocks_to_offset) * self.meta.superblock.block_size as u64
+                    - byte_in_offset_block;
+                if bytes_left_in_extent >= remaining_bytes {
+                    // We can complete the read in this extent
+                    let mut buf = vec![0u8; remaining_bytes as usize];
+                    self.store_fd.read_at(&mut buf, offset_byte_i)?;
+                    data_bytes.extend(&buf);
+                    break
+                } else {
+                    let mut buf = vec![0u8; bytes_left_in_extent as usize];
+                    self.store_fd.read_at(&mut buf, offset_byte_i)?;
+                    data_bytes.extend(&buf);
+                    // Decrease remaining bytes
+                    remaining_bytes -= bytes_left_in_extent;
+                    // And then continue the loop over extents
+                }
+            } else if remaining_blocks_to_offset != 0 {
+                // In this case, we haven't yet found the offset block and we
+                // need to continue looking for it before we can start reading
+                // NOTE: At this point, we know that ex_size <= remaining_blocks_to_offset
+                // so we can mark this extent as covered --- decreasing the
+                // remaining blocks counter by its size (in blocks) --- and
+                // continuing with the loop.
+                remaining_blocks_to_offset -= ex_size;
+            } else {
+                // In this case, we've already passed the offset block and are
+                // on our way in the section to be read
+                let ex_start_byte_i = ex.0 * self.meta.superblock.block_size as u64;
+                let bytes_in_extent = ex_size * self.meta.superblock.block_size as u64;
+                if bytes_in_extent >= remaining_bytes {
+                    // We can complete the read in this extent
+                    let mut buf = vec![0u8; remaining_bytes as usize];
+                    self.store_fd.read_at(&mut buf, ex_start_byte_i)?;
+                    data_bytes.extend(&buf);
+                    break
+                } else {
+                    let mut buf = vec![0u8; bytes_in_extent as usize];
+                    self.store_fd.read_at(&mut buf, ex_start_byte_i)?;
+                    data_bytes.extend(&buf);
+                    // Decrease remaining bytes
+                    remaining_bytes -= bytes_in_extent;
+                    // And then continue the loop over extents
+                }
+            }
+        };
+        // Update metadata and return
+        // Update inode attributes (last accessed time)
+        let new_attr = InodeAttributes {
+            last_accessed: time_now(),
+            ..attr
+        };
+        self.set_inode_attr(inode, new_attr);
+        Ok(data_bytes)
     }
 
-    fn read_inode(&self, inode_idx: u64) -> io::Result<InodeAttributes> {
-        let offset = self.superblock.itable_start
-            + (inode_idx * size_of::<InodeAttributes>() as u64);
-        
-        // Create buffer and read
-        let mut buf = vec![0u8; size_of::<InodeAttributes>()];
-        self.block_store_fd.read_at(&mut buf, offset)?; 
-        
-        //Convert bytes back, basically reverse of a step in write_inode
-        bincode::deserialize(&buf)
-            .map_err(|e| io::Error::new(ErrorKind::Other, e))
+    fn read_directory(&self, inode: INodeNo) -> Result<DirectoryEntries, Errno> {
+        // Get inode attributes from inode table
+        let attr = match self.get_inode_attr(inode) {
+            Ok(i) => i,
+            Err(e) => return Err(e),
+        };
+        // Check that inode is actually a directory
+        if attr.kind != FileKind::Directory {
+            return Err(Errno::ENOTDIR)
+        };
+        // Read in and deserialize the entries data structure from disk
+        // Loop over array of extents and collect all bytes in directory file.
+        let mut dir_bytes: Vec<u8> = Vec::new();
+        // debug!("current extents: {:?}", attr.extent_index);
+        for ex in &attr.extent_index {
+            let read_b = match self.read_extent(ex) {
+                Ok(r) => r,
+                Err(e) => return Err(e),
+            };
+            dir_bytes.extend(read_b)
+        };
+
+        // NOTE: This should just be done by (de)serializing to JSON using the
+        // default serde serializer. We will try to implement/add in a more
+        // efficient serialization procedure later on.
+        // NOTE: Use the size of the file to only read appropriate bytes.
+        // println!("{}", attr.size);
+        // debug!("serialized entries in bytes: {:?}", &dir_bytes[..(attr.size) as usize]);
+        let entries = match serde_json::from_slice(&dir_bytes[..(attr.size as usize)]) {
+            Ok(e) => e,
+            // TODO: Serialization here is not working as expected, your serde_json
+            // is not able to successfully deserialize from slice. Need to fix
+            // this, or just give up on serialization.
+            Err(_) => return Err(Errno::EINVAL),
+        };
+        // debug!("entries: {:?}", entries);
+        // Update inode attributes (last accessed time)
+        let new_attr = InodeAttributes {
+            last_accessed: time_now(),
+            ..attr
+        };
+        self.set_inode_attr(inode, new_attr);
+        return Ok(entries)
+    }
+
+    // Completely replace existing directory entries with new entries.
+    fn write_directory(&self, inode: INodeNo, entries: &DirectoryEntries) -> Result<(), Errno> {
+        // Get inode attributes from inode table
+        let attr = match self.get_inode_attr(inode) {
+            Ok(i) => i,
+            Err(e) => return Err(e),
+        };
+        // Check that inode is actually a directory
+        if attr.kind != FileKind::Directory {
+            return Err(Errno::ENOTDIR)
+        };
+        // Serialize entries into bytes
+        let mut b_entries = serde_json::to_vec(entries).unwrap();
+        // Save full size of serialized byte vector before we consume it below.
+        let full_size = b_entries.len() as u64;
+        // debug!("original entries in bytes: {:?}", b_entries);
+        // NOTE: This is some cursed imperative code. But this whole project is
+        // cursed now, so who cares.
+        // Write pieces of serialized entries into block extents
+        // debug!("original extents: {:?}", attr.extent_index);
+        for ex in &attr.extent_index {
+            b_entries = match self.write_extent(ex, b_entries) {
+                Ok(remaining_b) => remaining_b,
+                Err(e) => return Err(e),
+            };
+            // debug!("remaining bytes: {:?}", b_entries);
+            if b_entries.len() == 0 {
+                let new_attr = InodeAttributes {
+                    size: full_size,
+                    last_modified: time_now(),
+                    last_metadata_changed: time_now(),
+                    ..attr
+                };
+                self.set_inode_attr(inode, new_attr);
+                return Ok(())
+            }
+        }
+        // If we get here, there must be more bytes to write and we need to
+        // add some more extents
+        let new_extents = match self.allocate_blocks(b_entries.len()) {
+            Some(exs) => exs,
+            None => return Err(Errno::ENOSPC),
+        };
+        // Write remaining data to new extents
+        // TODO: There must be some way to duplicate and simplify some of this
+        // code.
+        for ex in &new_extents {
+            b_entries = match self.write_extent(ex, b_entries) {
+                Ok(remaining_b) => remaining_b,
+                Err(e) => return Err(e),
+            };
+            // debug!("remaining bytes: {:?}", b_entries);
+            if b_entries.len() == 0 {
+                break
+            }
+        }
+        // Merge old extents with new extents and add to attributes
+        let mut all_extents = attr.extent_index.clone();
+        all_extents.extend(new_extents);
+        // debug!("all extents: {:?}", all_extents);
+        let new_attr = InodeAttributes {
+            size: full_size,
+            last_modified: time_now(),
+            last_metadata_changed: time_now(),
+            extent_index: all_extents,
+            ..attr
+        };
+        self.set_inode_attr(inode, new_attr);
+        return Ok(())
+    }
+
+    fn lookup_name(&self, parent: INodeNo, name: &OsStr) -> Result<InodeAttributes, Errno> {
+        let entries = self.read_directory(parent)?;
+        let name_string = match name.to_str() {
+            Some(s) => s.to_string(),
+            None => return Err(Errno::EINVAL),
+        };
+        if let Some((inode, _)) = entries.get(&name_string) {
+            return self.get_inode_attr(INodeNo(*inode));
+        }
+        return Err(Errno::ENOENT);
     }
 }
 
 // Implement the Filesystem trait to integrate FuseFS with fuser.
 impl Filesystem for FuseFS {
-    // TODO: Fill out this stuff.
-
-    //initialize filesystem. called before any other filesystem method.
-    fn init(&mut self, _req: &Request, _config: &mut fuser::KernelConfig) -> Result<(), std::io::Error> {
+    fn init(&mut self,
+            _req: &Request,
+            _config: &mut fuser::KernelConfig,
+    ) -> io::Result<()> {
         info!("Filesystem mounted successfully");
-
-        // Set up root directory as inode 1
-        let root_inode_idx = 1usize;
-        let chunk = root_inode_idx / 1024;
-        let bit = root_inode_idx % 1024;
-
-
-        let mut inode_bitmap_binding = self.inode_bitmap.write().unwrap();
-        let bitmap_chunk = match inode_bitmap_binding.get_mut(chunk){
-            Some(slot) => slot,
-            None => return Err(std::io::Error::new(ErrorKind::Other, "failed to get inode bitmap chunk"))
-        };
-
-        //mark bitmap entry as allocated
-        bitmap_chunk.set(bit, true);
-
-        let root_inode = InodeAttributes{
-            inode: root_inode_idx as u64,
+        // NOTE: It looks like POSIX filesystems reserve inode 0 for other
+        // purposes, such as marking deleted directory entries. Very weird.
+        // https://utcc.utoronto.ca/~cks/space/blog/unix/POSIXAllowsZeroInode
+        // https://news.ycombinator.com/item?id=44142955
+        let root_inode: u64 = INodeNo::ROOT.0;
+        // Allocate first inode for root
+        // If root is 1, we also need to fix the inode allocation logic above.
+        // NOTE: This is fixed, see that part of the code for details.
+        self.meta.inode_bitmap.write().unwrap()[0].set(root_inode as usize, true);
+        let root_inode_attr = InodeAttributes {
+            inode: root_inode,
+            open_file_handles: 0,
             size: 0,
             kind: FileKind::Directory,
-            mode: 0o755,
+            last_accessed: time_now(),
+            last_modified: time_now(),
+            last_metadata_changed: time_now(),
+            mode: 0o777,
             hardlinks: 2,
             uid: 0,
             gid: 0,
-            ..Default::default()
+            extent_index: Vec::new(),
         };
-        //insert into inode table
-        self.set_inode_table(root_inode_idx as u64, root_inode);
+        self.set_inode_attr(INodeNo::ROOT, root_inode_attr);
+        let mut entries = BTreeMap::new();
+        entries.insert(".".to_string(), (root_inode, FileKind::Directory));
+        // Just unwrap this --- this should never return an error, and if it
+        // does, we should probably panic anyway.
+        self.write_directory(INodeNo(root_inode), &entries).unwrap();
         Ok(())
     }
 
-    // get file attributes
-    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: fuser::ReplyAttr) {
-        let chunk = ino.0 as usize / 1024;
-        let bit = ino.0 as usize % 1024;
+    fn destroy(&mut self) {
+        // Flush metadata to disk
+        self.flush_meta();
+        // fsync both metadata and block data
+        // NOTE: We just ignore if there's an error here for now; I guess we
+        // could make an error here more explicit, but there's also not much
+        // to do even if there is an error.
+        let _ = self.meta_fd.sync_all();
+        let _ = self.store_fd.sync_all();
+    }
 
-        let inode_bitmap_binding = self.inode_bitmap.read().unwrap();
-        let bitmap_chunk = match inode_bitmap_binding.get(chunk){
-            Some(slot) => slot,
-            None => return reply.error(Errno::ENOENT) 
+    fn getattr(&self,
+               _req: &Request,
+               ino: INodeNo,
+               _fh: Option<FileHandle>,
+               reply: fuser::ReplyAttr,
+    ) {
+        // Look up the inode attributes in the inode table
+        let inode = match self.get_inode_attr(ino) {
+            Ok(i) => i,
+            Err(e) => {
+                reply.error(e);
+                return;
+            }
         };
-
-        // Check if inode is allocated in the bitmap
-        if !bitmap_chunk.get(bit){
-            reply.error(Errno::ENOENT);
-            return;
-        }
-
-        // Look up the inode in the table
-        let binding: &std::sync::RwLockReadGuard<'_, Vec<InodeAttributes>> = &self.inode_table.read().unwrap();
-        let inode = match binding.get(ino.0 as usize){
-            Some(ino) => ino,
-            None => return reply.error(Errno::EINVAL)
-        };
-        
-
-        let kind = match inode.kind {
-            FileKind::File => fuser::FileType::RegularFile,
-            FileKind::Directory => fuser::FileType::Directory,
-            FileKind::Symlink => fuser::FileType::Symlink,
-        };
-
-        let attrs = fuser::FileAttr {
-            ino: ino,
-            size: inode.size,
-            blocks: (inode.size + self.superblock.block_size as u64 - 1)
-                / self.superblock.block_size as u64,
-            atime: std::time::UNIX_EPOCH
-                + std::time::Duration::new(inode.last_accessed.0 as u64, inode.last_accessed.1),
-            mtime: std::time::UNIX_EPOCH
-                + std::time::Duration::new(inode.last_modified.0 as u64, inode.last_modified.1),
-            ctime: std::time::UNIX_EPOCH
-                + std::time::Duration::new(inode.last_metadata_changed.0 as u64, inode.last_metadata_changed.1),
-            crtime: std::time::UNIX_EPOCH,
-            kind,
-            perm: inode.mode,
-            nlink: inode.hardlinks,
-            uid: inode.uid,
-            gid: inode.gid,
-            rdev: 0,
-            blksize: self.superblock.block_size,
-            flags: 0,
-        };
-
+        // Convert InodeAttributes to fuser::FileAttr
+        let attrs = self.inode_attr_to_file_attr(&inode);
+        // Return attributes in the appropriate way
         reply.attr(&std::time::Duration::from_secs(1), &attrs);
     }
 
-    // read directory
-    fn readdir(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64, mut reply: fuser::ReplyDirectory) {
-        // Error for non-existent directory
-        if ino.0 != 1 {
-            reply.error(Errno::ENOENT);
-            return;
-        }
-
-        // Directory entries
-        let mut entries = vec![
-            (INodeNo(1), fuser::FileType::Directory, ".".to_string()),
-            (INodeNo(1), fuser::FileType::Directory, "..".to_string()),
-        ];
-
-        // Add any files that have been created
-        if let Some(children) = self.dir_entries.read().unwrap().get(&ino.0) {
-            for (child_ino, name) in children {
-                entries.push((INodeNo(*child_ino), fuser::FileType::RegularFile, name.clone()));
+    fn setattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _mode: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        _size: Option<u64>,
+        _atime: Option<TimeOrNow>,
+        _mtime: Option<TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        _fh: Option<FileHandle>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<fuser::BsdFileFlags>,
+        reply: fuser::ReplyAttr,
+    ) {
+        // NOTE: What if we just made this a noop for now?
+        let inode = match self.get_inode_attr(ino) {
+            Ok(i) => i,
+            Err(e) => {
+                reply.error(e);
+                return;
             }
-        }
+        };
+        let attrs = self.inode_attr_to_file_attr(&inode);
+        reply.attr(&Duration::from_secs(1), &attrs)
+        // TODO: Consider actually implementing some of this stuff, i.e. for
+        // chmod, chown, and whatever else uses this function.
+    }
 
-        // Send back to kernel
-        for (i, (inode, kind, name)) in entries.iter().enumerate().skip(offset as usize) {
-            if reply.add(*inode, (i + 1) as u64, *kind, name) {
+    fn readdir(&self, _req: &Request,
+               ino: INodeNo,
+               _fh: FileHandle,
+               offset: u64,
+               mut reply: fuser::ReplyDirectory
+    ) {
+        debug!("readdir() called with {ino:?}");
+        let entries = match self.read_directory(ino) {
+            Ok(entries) => entries,
+            Err(error_code) => {
+                reply.error(error_code);
+                return;
+            }
+        };
+        // debug!("entries: {:?}", entries);
+
+        for (index, entry) in entries.iter().skip(offset as usize).enumerate() {
+            let (name, (inode, file_type)) = entry;
+            let buffer_full: bool = reply.add(
+                INodeNo(*inode),
+                offset + index as u64 + 1,
+                (*file_type).into(),
+                OsStr::new(name),
+            );
+
+            if buffer_full {
                 break;
             }
         }
@@ -528,495 +1072,251 @@ impl Filesystem for FuseFS {
         reply.ok();
     }
 
-    
-
-    // look up a directory entry by name and get it's attributes
-    // need lookup before implementing create
+    // Look up a directory entry by name and get its attributes.
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: fuser::ReplyEntry) {
-        if parent.0 != 1 {
-            reply.error(Errno::ENOENT);
-            return;
-        }
-
-        // search dir_entries for the file
-        let inode_no = self.find_dir_entry(parent.0, name);
-        if inode_no.is_none() {
-            reply.error(Errno::ENOENT);
-            return;
-        }
-        let inode_no = inode_no.unwrap();
-
-        // get the inode from the inode table
-        let inode_table_binding = self.inode_table.read().unwrap();
-        let inode = match inode_table_binding.get(inode_no as usize) {
-            Some(ino) => ino,
-            None => return reply.error(Errno::ENOENT),
+        // Lookup specific name in parent directory
+        let inode = match self.lookup_name(parent, name) {
+            Ok(a) => a,
+            Err(e) => {
+                reply.error(e);
+                return
+            }
         };
 
-        // convert fuser::FileType, important!
-        let kind = match inode.kind {
-            FileKind::File => fuser::FileType::RegularFile,
-            FileKind::Directory => fuser::FileType::Directory,
-            FileKind::Symlink => fuser::FileType::Symlink,
-        };
+        // Convert InodeAttributes to fuser::FileAttr
+        let attrs = self.inode_attr_to_file_attr(&inode);
 
-        // build file attributes from inode data
-        let attrs = fuser::FileAttr {
-            ino: INodeNo(inode_no),
-            size: inode.size,
-            blocks: self.blocks_allocated(inode.size),
-            atime: std::time::UNIX_EPOCH + std::time::Duration::new(inode.last_accessed.0 as u64, inode.last_accessed.1),
-            mtime: std::time::UNIX_EPOCH + std::time::Duration::new(inode.last_modified.0 as u64, inode.last_modified.1),
-            ctime: std::time::UNIX_EPOCH + std::time::Duration::new(inode.last_metadata_changed.0 as u64, inode.last_metadata_changed.1),
-            crtime: std::time::UNIX_EPOCH,
-            kind,
-            perm: inode.mode,
-            nlink: inode.hardlinks,
-            uid: inode.uid,
-            gid: inode.gid,
-            rdev: 0,
-            blksize: self.superblock.block_size,
-            flags: 0,
-        };
-
+        // NOTE: I don't really know what the Generation(0) thing is doing.
         reply.entry(&std::time::Duration::from_secs(1), &attrs, fuser::Generation(0));
     }
 
-    //create and open a file
-    fn create(&self, _req: &Request, parent: INodeNo, name: &OsStr,
-      _mode: u32, _umask: u32, _flags: i32, reply: fuser::ReplyCreate) {
-
-        if parent.0 != 1 {
-            reply.error(Errno::ENOENT);
+    fn create(&self,
+              req: &Request,
+              parent: INodeNo,
+              name: &OsStr,
+              mode: u32,
+              _umask: u32,
+              _flags: i32,
+              reply: fuser::ReplyCreate
+    ) {
+        debug!("create() called with {parent:?} {name:?}");
+        if self.lookup_name(parent, name).is_ok() {
+            reply.error(Errno::EEXIST);
             return;
         }
 
-        // allocate free inode
-        let inode_idx = match self.allocate_inode() {
+        // Allocate next free inode
+        let ino = match self.allocate_inode() {
             Some(idx) => idx,
             None => return reply.error(Errno::ENOSPC),
         };
 
-        // timestamp
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap();
+        // Update parent inode attributes
+        let mut parent_attrs = match self.get_inode_attr(parent) {
+            Ok(attrs) => attrs,
+            Err(error_code) => {
+                reply.error(error_code);
+                return;
+            }
+        };
+        parent_attrs.last_modified = time_now();
+        parent_attrs.last_metadata_changed = time_now();
+        // You can tell things are dark when I'm just cloning everything...
+        // One day I'll be better at Rust. I promise. (:
+        self.set_inode_attr(parent, parent_attrs.clone());
 
-        // create and store the inode
-        let new_inode = InodeAttributes {
-            inode: inode_idx,
+        // Create new inode attributes
+        let inode = InodeAttributes {
+            inode: ino.0,
+            open_file_handles: 1,
             size: 0,
-            kind: FileKind::File,
+            last_accessed: time_now(),
+            last_modified: time_now(),
+            last_metadata_changed: time_now(),
+            kind: as_file_kind(mode),
+            mode: self.creation_mode(mode),
             hardlinks: 1,
-            mode: 0o644,
-            uid: _req.uid(),
-            gid: _req.gid(),
-            ..Default::default()
-        };
-        self.set_inode_table(inode_idx, new_inode);
-
-        let attrs = fuser::FileAttr {
-            ino: INodeNo(inode_idx),
-            size: 0,
-            blocks: 0,
-            atime: std::time::UNIX_EPOCH + std::time::Duration::new(now.as_secs(), now.subsec_nanos()),
-            mtime: std::time::UNIX_EPOCH + std::time::Duration::new(now.as_secs(), now.subsec_nanos()),
-            ctime: std::time::UNIX_EPOCH + std::time::Duration::new(now.as_secs(), now.subsec_nanos()),
-            crtime: std::time::UNIX_EPOCH,
-            kind: fuser::FileType::RegularFile,
-            perm: 0o644,
-            nlink: 1,
-            uid: _req.uid(),
-            gid: _req.gid(),
-            rdev: 0,
-            blksize: self.superblock.block_size,
-            flags: 0,
+            uid: req.uid(),
+            gid: creation_gid(&parent_attrs, req.gid()),
+            extent_index: Vec::new(),
         };
 
-        self.dir_entries
-            .write()
-            .unwrap()
-            .entry(parent.0)
-            .or_insert_with(Vec::new)
-            .push((inode_idx, name.to_string_lossy().to_string()));
+        // Generate fuser::FileAttr from InodeAttributes for reply
+        let attrs = self.inode_attr_to_file_attr(&inode);
+        // Add new inode to inode table
+        self.set_inode_attr(ino, inode);
 
-        info!("Created file {:?}", name);
+        // If new inode is directory, add . and .. and write entries to disk.
+        if as_file_kind(mode) == FileKind::Directory {
+            let mut entries: DirectoryEntries = BTreeMap::new();
+            entries.insert(".".to_string(), (ino.0, FileKind::Directory));
+            entries.insert("..".to_string(), (parent.0, FileKind::Directory));
+            match self.write_directory(ino, &entries) {
+                Ok(()) => (),
+                Err(e) => {
+                    reply.error(e);
+                    return;
+                }
+            };
+        };
+
+        // Add the specified name to the parent directory
+        let name_string = match name.to_str() {
+            Some(s) => s.to_string(),
+            None => {
+                reply.error(Errno::EINVAL);
+                return
+            },
+        };
+        let mut parent_entries = match self.read_directory(parent) {
+            Ok(es) => es,
+            Err(e) => {
+                reply.error(e);
+                return
+            }
+        };
+        parent_entries.insert(name_string, (ino.0, as_file_kind(mode)));
+        match self.write_directory(parent, &parent_entries) {
+            Ok(()) => (),
+            Err(e) => {
+                reply.error(e);
+                return;
+            }
+        };
+        debug!("new parent entries {:?}", parent_entries);
+
+        // Return successful completion
+        info!("Created file {:?} with {ino:?}", name);
         reply.created(
-            &std::time::Duration::from_secs(1),
+            &Duration::from_secs(1),
             &attrs,
             fuser::Generation(0),
+            // Not really doing anything with FileHandles in this implementation.
             fuser::FileHandle(0),
             fuser::FopenFlags::empty(),
         );
     }
-    
-    // read data
-    fn read(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64,
-        size: u32, _flags: OpenFlags, _lock: Option<LockOwner>, reply: ReplyData) {
 
-        // check inode is allocated in bitmap
-        let chunk = ino.0 as usize / 1024;
-        let bit = ino.0 as usize % 1024;
-
-        let inode_bitmap_binding = self.inode_bitmap.read().unwrap();
-        let bitmap_chunk = match inode_bitmap_binding.get(chunk) {
-            Some(slot) => slot,
-            None => return reply.error(Errno::ENOENT),
+    // Read data
+    // TODO: Read returns an invalid argument error.
+    // TODO: Also writing beyond the end of a file seems to cause a panic.
+    fn read(&self,
+            _req: &Request,
+            ino: INodeNo,
+            _fh: FileHandle,
+            offset: u64,
+            size: u32,
+            _flags: OpenFlags,
+            _lock: Option<LockOwner>,
+            reply: ReplyData
+    ) {
+        debug!("read() called on {ino:?} offset={offset:?} size={size:?}");
+        let read_buf = match self.read_file(ino, offset, size) {
+            Ok(b) => b,
+            Err(e) => {
+                reply.error(e);
+                return
+            }
         };
-        if !bitmap_chunk.get(bit) {
-            return reply.error(Errno::ENOENT);
-        }
-        drop(inode_bitmap_binding);
-
-        // get inode from inode table
-        let inode_table_binding = self.inode_table.read().unwrap();
-        let inode = match inode_table_binding.get(ino.0 as usize) {
-            Some(ino) => ino,
-            None => return reply.error(Errno::ENOENT),
-        };
-
-        let block_size = self.superblock.block_size as u64;
-        let mut bytes_read_total = 0u64;
-        let mut result = vec![0u8; size as usize];
-
-        // walk extents to read data
-        let mut remaining = size as u64;
-        let mut current_offset = offset;
-
-        for (block_idx, _length) in inode.extent_index.iter() {
-            if remaining == 0 {
-                break;
-            }
-            if *block_idx == 0 {
-                continue;
-            }
-
-            let block_num = current_offset / block_size;
-            let block_offset = current_offset % block_size;
-            let bytes_to_read = remaining.min(block_size - block_offset);
-
-            let read_offset = self.offset_from_block_idx(*block_idx) + block_offset;
-            let buf_start = bytes_read_total as usize;
-            let buf_end = buf_start + bytes_to_read as usize;
-
-            match self.block_store_fd.read_at(&mut result[buf_start..buf_end], read_offset) {
-                Ok(n) => {
-                    bytes_read_total += n as u64;
-                    remaining -= n as u64;
-                    current_offset += n as u64;
-                }
-                Err(_) => return reply.error(Errno::EIO),
-            }
-
-            let _ = block_num; // suppress unused warning
-        }
-
-        reply.data(&result[..bytes_read_total as usize]);
+        reply.data(&read_buf)
     }
 
-    fn write(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64,
-         data: &[u8], _write_flags: WriteFlags, _flags: OpenFlags,
-         _lock_owner: Option<LockOwner>, reply: fuser::ReplyWrite) {
-
-        // get the inode from the inode table
-        let mut inode_table_binding= self.inode_table.write().unwrap();
-        let inode = match inode_table_binding.get_mut(ino.0 as usize) {
-            Some(ino) => ino,
-            None => return reply.error(Errno::ENOENT),
-        };
-
-        // figure out which block the offset falls into
-        let block_size = self.superblock.block_size as u64;
-        let block_num = offset / block_size;
-        let block_offset = offset % block_size;
-
-        // check if we already have a block allocated for this position
-        let block_idx = if inode.extent_index[block_num as usize].0 != 0 {
-            // block already allocated, reuse it
-            inode.extent_index[block_num as usize].0
-        } else {
-            // allocate a new block
-            let new_block = match self.allocate_block() {
-                Some(b) => b,
-                None => return reply.error(Errno::ENOSPC),
-            };
-            inode.extent_index[block_num as usize] = (new_block, 1);
-            new_block
-        };
-
-        // calculate the byte offset into the data region
-        let write_offset = self.offset_from_block_idx(block_idx) + block_offset;
-
-        // write data to disk
-        match self.block_store_fd.write_at(data, write_offset) {
-            Ok(bytes_written) => {
-                // update inode size if needed
-                let new_size = offset + bytes_written as u64;
-                if new_size > inode.size {
-                    inode.size = new_size;
-                }
-
-                // persist inode to disk
-                if let Err(e) = self.write_inode(ino.0, inode) {
-                    error!("failed to persist inode {}: {}", ino.0, e);
-                    return reply.error(Errno::EIO);
-                }
-
-                reply.written(bytes_written as u32);
+    fn write(&self,
+             _req: &Request,
+             ino: INodeNo,
+             _fh: FileHandle,
+             offset: u64,
+             data: &[u8],
+             _write_flags: WriteFlags,
+             _flags: OpenFlags,
+             _lock_owner: Option<LockOwner>,
+             reply: fuser::ReplyWrite
+    ) {
+        let data_written = match self.write_file(ino, offset, &data.to_vec()) {
+            Ok(n) => n,
+            Err(e) => {
+                reply.error(e);
+                return
             }
-            Err(_) => reply.error(Errno::EIO),
-        }
+        };
+        reply.written(data_written as u32)
     }
 
-    //create a symbolic link
-    fn symlink(&self, _req: &Request, parent: INodeNo, link_name: &OsStr, target: &Path, reply: ReplyEntry){
+    // TODO: Paste in simple.rs mkdir for reference.
+    // fn mkdir(
+    //     &self,
+    //     _req: &Request,
+    //     parent: INodeNo,
+    //     name: &OsStr,
+    //     mut mode: u32,
+    //     _umask: u32,
+    //     reply: ReplyEntry,
+    // ) {
+    //     debug!("mkdir() called with {parent:?} {name:?} {mode:o}");
+    //     if self.lookup_name(parent, name).is_ok() {
+    //         reply.error(Errno::EEXIST);
+    //         return;
+    //     }
 
-        // check if there is space in the inode table, if there is reserve the space
-        let free_inode_idx = self.allocate_inode();
-        //no space in inode table
-        if free_inode_idx.is_none(){
-            return reply.error(Errno::ENOSPC);
-        }
-        let inode_idx = free_inode_idx.unwrap();
+    //     let mut parent_attrs = match self.get_inode(parent) {
+    //         Ok(attrs) => attrs,
+    //         Err(error_code) => {
+    //             reply.error(error_code);
+    //             return;
+    //         }
+    //     };
 
-        // check if there is space in the data region and then try to allocate space for the symlink
-        let free_block_idx = self.allocate_block();
-        //no space in data region
-        if free_block_idx.is_none(){
-            return reply.error(Errno::ENOSPC);
-        }
-        let block_idx = free_block_idx.unwrap();
+    //     if !check_access(
+    //         parent_attrs.uid,
+    //         parent_attrs.gid,
+    //         parent_attrs.mode,
+    //         _req.uid(),
+    //         _req.gid(),
+    //         AccessFlags::W_OK,
+    //     ) {
+    //         reply.error(Errno::EACCES);
+    //         return;
+    //     }
+    //     parent_attrs.last_modified = time_now();
+    //     parent_attrs.last_metadata_changed = time_now();
+    //     self.write_inode(&parent_attrs);
 
-        //store target link path as slice of bytes in data region 
-        let path_bytes = target.as_os_str().as_encoded_bytes();
-        let offset = self.offset_from_block_idx(block_idx);
+    //     if _req.uid() != 0 {
+    //         mode &= !(libc::S_ISUID | libc::S_ISGID) as u32;
+    //     }
+    //     if parent_attrs.mode & libc::S_ISGID as u16 != 0 {
+    //         mode |= libc::S_ISGID as u32;
+    //     }
 
-        //try to write the path into a data block
-        let res = self.block_store_fd.write_at(path_bytes, offset);
-        if res.is_err(){
-            return reply.error(Errno::EIO);
-        }
+    //     let inode = self.allocate_next_inode();
+    //     let attrs = InodeAttributes {
+    //         inode: inode.0,
+    //         open_file_handles: 0,
+    //         size: u64::from(BLOCK_SIZE),
+    //         last_accessed: time_now(),
+    //         last_modified: time_now(),
+    //         last_metadata_changed: time_now(),
+    //         kind: FileKind::Directory,
+    //         mode: self.creation_mode(mode),
+    //         hardlinks: 2, // Directories start with link count of 2, since they have a self link
+    //         uid: _req.uid(),
+    //         gid: creation_gid(&parent_attrs, _req.gid()),
+    //         xattrs: BTreeMap::default(),
+    //     };
+    //     self.write_inode(&attrs);
 
-        //create an inode for the symlink
-        let symlink_attrs = InodeAttributes{
-            inode: inode_idx,
-            open_file_handles: 0,
-            size: path_bytes.len() as u64,
-            kind: FileKind::Symlink,
-            hardlinks: 1,
-            mode: 0o644,
-            uid: _req.uid(),
-            gid: _req.gid(),
-            extent_index: [(block_idx, 1), (0,0), (0,0), (0,0), (0,0), (0,0), (0,0), (0,0)],
-            ..Default::default()
-        };
+    //     let mut entries = BTreeMap::new();
+    //     entries.insert(b".".to_vec(), (inode.0, FileKind::Directory));
+    //     entries.insert(b"..".to_vec(), (parent.0, FileKind::Directory));
+    //     self.write_directory_content(inode, &entries);
 
-        //need to return a fuser fileattr
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap();
+    //     let mut entries = self.get_directory_content(parent).unwrap();
+    //     entries.insert(name.as_bytes().to_vec(), (inode.0, FileKind::Directory));
+    //     self.write_directory_content(parent, &entries);
 
-        let attrs = fuser::FileAttr {
-            ino: INodeNo(inode_idx),
-            size: symlink_attrs.size,
-            blocks: self.blocks_allocated(symlink_attrs.size),
-            atime: std::time::UNIX_EPOCH + std::time::Duration::new(now.as_secs(), now.subsec_nanos()),
-            mtime: std::time::UNIX_EPOCH + std::time::Duration::new(now.as_secs(), now.subsec_nanos()),
-            ctime: std::time::UNIX_EPOCH + std::time::Duration::new(now.as_secs(), now.subsec_nanos()),
-            crtime: std::time::UNIX_EPOCH,
-            kind: fuser::FileType::Symlink,
-            perm: 0o644,
-            nlink: 1,
-            uid: _req.uid(),
-            gid: _req.gid(),
-            rdev: 0,
-            blksize: self.superblock.block_size,
-            flags: 0
-        };
+    //     reply.entry(&Duration::new(0, 0), &attrs.into(), fuser::Generation(0));
+    // }
 
-        //store inode in inode table
-        self.set_inode_table(inode_idx, symlink_attrs);
-
-        //also add it to the parent directory
-        self.dir_entries
-            .write()
-            .unwrap()
-            .entry(parent.0)
-            .or_insert_with(Vec::new)
-            .push((inode_idx, link_name.to_string_lossy().to_string()));
-
-        reply.entry(&std::time::Duration::from_secs(1), &attrs, fuser::Generation(0));
-    }
-
-    //create a hard link
-    fn link(&self, _req: &Request, ino: INodeNo, newparent: INodeNo, newname: &OsStr, reply: ReplyEntry){
-        let chunk = ino.0 as usize / 1024;
-        let bit = ino.0 as usize % 1024;
-
-        let inode_bitmap_binding = self.inode_bitmap.read().unwrap();
-        let bitmap_chunk = match inode_bitmap_binding.get(chunk){
-            Some(slot) => slot,
-            None => return reply.error(Errno::ENOENT) 
-        };
-
-        //check that the inode we're trying to link to already exists
-        if !bitmap_chunk.get(bit) {
-                reply.error(Errno::EINVAL);
-                return;
-        }
-
-        //get inode from inode table 
-        let mut inode_table_binding = self.inode_table.write().unwrap();
-        let inode: &mut InodeAttributes = match inode_table_binding.get_mut(ino.0 as usize){
-            Some(ino) => ino,
-            None => return reply.error(Errno::EINVAL)
-        };
-
-        //increment the hardlinks counter in inode
-        inode.hardlinks = inode.hardlinks + 1;
-
-        //create a new entry in the parent directory
-        self.dir_entries
-            .write()
-            .unwrap()
-            .entry(newparent.0)
-            .or_insert_with(Vec::new)
-            .push((ino.0, newname.to_string_lossy().to_string()));
-
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap();
-        
-        let filekind = match inode.kind {
-            FileKind::File => fuser::FileType::RegularFile,
-            FileKind::Directory => fuser::FileType::Directory,
-            FileKind::Symlink => fuser::FileType::Symlink,
-        };
-
-
-        //return hardlink as fuser fileattr
-        let attrs = fuser::FileAttr{
-            ino: ino,
-            size: inode.size,
-            blocks: self.blocks_allocated(inode.size),
-            atime: std::time::UNIX_EPOCH + std::time::Duration::new(now.as_secs(), now.subsec_nanos()),
-            mtime: std::time::UNIX_EPOCH + std::time::Duration::new(now.as_secs(), now.subsec_nanos()),
-            ctime: std::time::UNIX_EPOCH + std::time::Duration::new(now.as_secs(), now.subsec_nanos()),
-            crtime: std::time::UNIX_EPOCH,
-            kind: filekind,
-            perm: inode.mode,
-            nlink: inode.hardlinks,
-            uid: _req.uid(),
-            gid: _req.gid(),
-            rdev: 0,
-            blksize: self.superblock.block_size,
-            flags: 0
-        };
-        reply.entry(&std::time::Duration::from_secs(1), &attrs, fuser::Generation(0));
-    }
-
-    //read symbolic link
-    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData){
-        //make sure the symlink inode exists
-        //check if the inode is allocated in the bitmap
-        let chunk = ino.0 as usize / 1024;
-        let bit = ino.0 as usize % 1024;
-
-        let inode_bitmap_binding = self.inode_bitmap.read().unwrap();
-        let bitmap_chunk = match inode_bitmap_binding.get(chunk){
-            Some(slot) => slot,
-            None => return reply.error(Errno::ENOENT) 
-        };
-
-        if !bitmap_chunk.get(bit) {
-            reply.error(Errno::ENOENT);
-            return;
-        }
-
-        //also make sure its a symlink
-        let inode_table_binding = self.inode_table.read().unwrap();
-        let inode = match inode_table_binding.get(ino.0 as usize){
-            Some(ino) => ino,
-            None => return reply.error(Errno::EINVAL)
-        };
-        if inode.kind != FileKind::Symlink{
-            return reply.error(Errno::EINVAL);
-        }
-
-        //get the block address from the extent
-        let block_idx = inode.extent_index[0].0;
-
-        //calculate offset into data region
-        let offset = self.offset_from_block_idx(block_idx);
-
-        //buffer to read in symlink
-        //symlink stored as array of bytes
-        let mut path_bytes = vec![0u8; inode.size as usize];
-
-        //try to read the information from the data region 
-        let res = self.block_store_fd.read_at(&mut path_bytes, offset);
-        if res.is_err(){
-            return reply.error(Errno::EIO);
-        }
-
-        //return symlink path as replydata
-        let bytes_read = res.unwrap();
-        reply.data(&path_bytes[..bytes_read]);
-    }
-
-    //remove a file
-    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty){
-        //lookup the file to get the inode number
-        let target_inode_no = self.find_dir_entry(parent.0, name);
-
-        //if target does not exist, can't unlink
-        if target_inode_no.is_none(){
-            return reply.error(Errno::ENOENT);
-        }
-        let inode_no = target_inode_no.unwrap();
-
-  
-        //decrement the number of hardlinks
-        let (hardlinks, extent_idx)= match self.decrement_links(inode_no){
-            Some((link_no, extent_idx)) => (link_no, extent_idx),
-            None => return reply.error(Errno::EINVAL)
-        };
-
-        //remove from parent directory
-        let mut dir_entries_binding = self.dir_entries.write().unwrap();
-        if let Some(entries) = dir_entries_binding.get_mut(&parent.0){
-            let mut i = 0;
-            while i < entries.len(){
-                if entries[i].1.as_str() == name.to_string_lossy().as_ref(){
-                    entries.remove(i);
-                    break;
-                }
-
-                i += 1;
-            }
-        }
-        //drop the RwLock for dir_entries
-        drop(dir_entries_binding);
-
-
-        //if this was the last link, release the data
-        if hardlinks == 1{
-            //remove the inode from the inode table
-            self.free_inode(inode_no);
-
-            //clear all data in data region used by file
-            for(start_block, length) in extent_idx{
-                if start_block != 0{
-                    for block_idx in start_block..(start_block + length){
-                        self.free_block(block_idx);
-                    }
-                }
-            }
-        }
-
-        reply.ok();
-    }
-  
 }
 
 #[derive(Parser)]
@@ -1025,8 +1325,9 @@ struct Args {
     /// Act as a client, and mount FUSE at given path
     mount_point: PathBuf,
 
-    /// Declares the name of the backing filestore
-    block_file: PathBuf,
+    /// Declares the name of the directory holding the metadata file and the
+    /// backing file that simulates "block" storage
+    fs_dir: PathBuf,
 
     /// Mount FUSE with direct IO
     #[arg(long, requires = "mount_point")]
@@ -1058,19 +1359,21 @@ struct Args {
 
 fn valid_block_size(s: &str) -> Result<u32, String> {
     let bl_size: usize = s.parse().map_err(|_| format!("`{s}` is not a number"))?;
-    if bl_size % 4096 == 0 {
+    let multiple_of = 1024;
+    if bl_size % multiple_of == 0 {
         Ok(bl_size as u32)
     } else {
-        Err(format!("`{s}` must be a multiple of 412"))
+        Err(format!("`{s}` must be a multiple of {}", multiple_of))
     }
 }
 
 fn valid_bitmap_size(s: &str) -> Result<u64, String> {
     let bm_size: usize = s.parse().map_err(|_| format!("`{s}` is not a number"))?;
-    if bm_size % 1024 == 0 {
+    let multiple_of = 1024;
+    if bm_size % multiple_of == 0 {
         Ok(bm_size as u64)
     } else {
-        Err(format!("`{s}` must be a multiple of 1024"))
+        Err(format!("`{s}` must be a multiple of {}", multiple_of))
     }
 }
 
@@ -1147,26 +1450,12 @@ fn main() {
 
     // Check if the backing filestore exists. If it does, attempt to load the
     // existing filesystem. Otherwise, create a new file as the backing store.
-    let block_file: &Path = args.block_file.as_path();
-    let fs = if block_file.exists() {
-        info!("specified filesystem already exists");
-        info!("loading existing filesystem");
-        match File::open(block_file) {
-            Ok(f) => FuseFS::load(f),
-            Err(e) => panic!("could not open file {} with error: {}",
-                             block_file.display(),
-                             e.to_string()),
-        }
-    } else {
-        info!("creating new filesystem at {}", block_file.display());
-        match File::create(block_file) {
-            Ok(f) => FuseFS::new(f, block_size, num_inodes, num_blocks),
-            Err(e) => panic!("could not create file {} with error: {}",
-                             block_file.display(),
-                             e.to_string()),
-        }
+    let fs = match FuseFS::new(args.fs_dir, block_size, num_inodes, num_blocks) {
+        Ok(f) => f,
+        Err(e) => panic!("Failed to create filesystem: {}", e),
     };
 
+    // Mount filesystem at declared mount point.
     let result = fuser::mount2(fs, &args.mount_point, &cfg);
     if let Err(e) = result {
         // Return a special error code for permission denied, which usually
